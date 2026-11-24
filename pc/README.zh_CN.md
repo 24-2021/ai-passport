@@ -42,7 +42,8 @@ python pc/kfb24_bridge.py --configure --ssid "我的Wi-Fi" --password "密码"
 
 - 只启动本次会话：`pc\start_bridge.cmd`。
 - 取消自启并停止桥接：`pc\uninstall_autostart.cmd`。
-- 启动器始终传入 `--ble`，因此 USB 被占用或没插线时仍可通过 BLE 控制。
+- 启动器始终传入 `--ble`，因此 USB 被占用或没插线时仍可通过 BLE 控制；传
+  `--ble-only` 可完全跳过 USB。
 
 ## 启动桥接
 
@@ -74,6 +75,16 @@ python pc/kfb24_bridge.py --ble
 开发板以 `kfb24` 为名广播 Nordic UART Service。`--ble` 让桥接在 USB/TCP 之外再作为
 BLE central 连接开发板；`--ble-name` 可修改广播名。BLE 是免 USB 线的替代通道，不是
 手机遥控通道。开发板重启或离开范围后，桥接会自动重连。
+
+只走蓝牙、不打开 USB 串口：
+
+```powershell
+python pc/kfb24_bridge.py --ble-only
+```
+
+`--ble-only` 隐含 `--ble` 并跳过串口自动查找。开发板只需供电，Windows 蓝牙必须打开。
+`pc\start_bridge.cmd --ble-only` 同样可用。连接后开发板显示 `ble 1 bridge`，八个动作
+及其 ACK 都走 NUS。此模式不传板载 PCM，语音动作使用电脑麦克风。
 
 BLE NUS 通道没有应用层认证。范围内任何能连接 `kfb24` 的 BLE central 都能发送与
 桥接相同的命令，因此只应在可信环境启用 `--ble`。

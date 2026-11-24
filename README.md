@@ -16,6 +16,12 @@ Windows 快捷控制台。三颗实体按键、一块 240×320 屏幕，通过 U
 
 <p align="center"><sub>kfb24 主界面预览（按 240×320 的实际卡片布局生成，不是设备照片）</sub></p>
 
+<p align="center">
+  <img src="assets/images/kfb24-boot.png" alt="kfb24 开机画面：青色 24 标志、kfb24 字标和 PC COMMAND CONSOLE 标语" width="264">
+</p>
+
+<p align="center"><sub>开机画面：品牌页显示约 1 秒后进入主界面（按 240×320 实际布局生成）</sub></p>
+
 ## 功能
 
 - **八个动作**：语音输入、微信输入法、微信、Orca、终端、Trae、Chrome、Edge。
@@ -28,6 +34,8 @@ Windows 快捷控制台。三颗实体按键、一块 240×320 屏幕，通过 U
   状态切换：没有窗口就启动，已最小化就恢复并聚焦，已在前台就最小化，其他情况聚焦
   到前台，不重复启动进程。
 - **三种连接**：USB 串口、Wi-Fi TCP、BLE（Nordic UART Service）。
+- **蓝牙独立控制**：`--ble-only` 不打开 USB 串口，直接通过 BLE 连接开发板；八个
+  动作、执行结果和连接状态都走 NUS。语音动作此时使用电脑麦克风，不传板载 PCM。
 - **断线可恢复**：PC 桥接每两秒发送心跳；BLE 断开后自动重连；开发板显示当前
   通道和桥接状态。
 - **离线可用**：动作全部在本机执行，不依赖云服务；Wi-Fi 仅用于开发板与电脑通信。
@@ -89,8 +97,17 @@ python -m pip install -r pc/requirements.txt
 python pc/kfb24_bridge.py --port COM6 --ble
 ```
 
+只走蓝牙、不占用串口：
+
+```powershell
+python pc/kfb24_bridge.py --ble-only
+```
+
 - `--port` 省略时自动查找 Espressif USB 串口。
 - `--ble` 需要 `bleak`，让桥接同时作为 BLE central 连接广播名 `kfb24` 的开发板。
+- `--ble-only` 隐含 `--ble`，跳过串口；开发板只需供电，不必连接电脑 USB 数据口。
+  `pc\start_bridge.cmd --ble-only` 同样可用。Windows 蓝牙必须打开，开发板会显示
+  `ble 1 bridge`。
 - 默认 TCP 端口 `8765`；只应在可信局域网运行。
 - `--dry-run` 只打印动作，不发送输入或启动程序。
 

@@ -1460,12 +1460,14 @@ def run_bridge(args, config: dict) -> int:
     except RuntimeError as error:
         log(f"bridge: {error}")
         return 0
-    port = find_serial_port(args.port)
+    port = None if args.ble_only else find_serial_port(args.port)
     if not port and args.port:
         log(f"serial: {args.port} not found")
         release_single_instance()
         return 2
-    if not port:
+    if args.ble_only:
+        log("serial: disabled (--ble-only)")
+    elif not port:
         log("serial: board not found; continuing with BLE/TCP")
     actions = Actions(config, dry_run=args.dry_run)
     try:
@@ -1503,6 +1505,8 @@ def main() -> int:
                         help=f"JSON config (default {DEFAULT_CONFIG})")
     parser.add_argument("--ble", action="store_true",
                         help="also connect to the board over BLE (requires bleak)")
+    parser.add_argument("--ble-only", action="store_true",
+                        help="use BLE only; do not open the USB serial port")
     parser.add_argument("--ble-name", default="kfb24",
                         help="BLE advertising name (default kfb24)")
     parser.add_argument("--verbose", action="store_true",
@@ -1522,6 +1526,12 @@ def main() -> int:
                         help="run one action locally and exit")
     args = parser.parse_args()
 
+    if args.ble_only:
+        if args.port:
+            parser.error("--ble-only cannot be combined with --port")
+        if args.configure:
+            parser.error("--ble-only cannot be combined with --configure")
+        args.ble = True
     if args.list_ports:
         list_serial_ports()
         return 0

@@ -48,7 +48,7 @@ login, so the board no longer needs a manually opened terminal.
 - Start only this session: `pc/start_bridge.cmd`.
 - Remove autostart and stop the bridge: `pc/uninstall_autostart.cmd`.
 - The launcher always passes `--ble`, so a busy USB port or an unplugged cable
-  can still be controlled over BLE.
+  can still be controlled over BLE. Pass `--ble-only` to skip USB entirely.
 
 ## Run the bridge
 
@@ -84,6 +84,18 @@ bridge a BLE central in addition to USB/TCP; `--ble-name` changes the advertised
 name. BLE is a cable-free alternative to USB, not a phone remote-control path.
 The bridge reconnects automatically after the board restarts or moves out of
 range.
+
+For Bluetooth-only control, with no USB serial port opened:
+
+```powershell
+python pc/kfb24_bridge.py --ble-only
+```
+
+`--ble-only` implies `--ble` and skips serial autodetection. The board only needs
+power, and Windows Bluetooth must be on. `pc/start_bridge.cmd --ble-only` works
+too. A connected board reports `ble 1 bridge`; all eight actions and their ACKs
+use the NUS link. The voice action uses the PC microphone in this mode because
+BLE does not carry board PCM.
 
 The NUS link has no application-layer authentication. Any BLE central in range
 that connects to `kfb24` can send the same commands as the bridge, so enable
