@@ -12,9 +12,11 @@ on the receiving transport.
 ## Requirements
 
 - Windows 10/11.
-- Python 3.9 or newer with `pyserial` and `sounddevice`; `bleak` is additionally
-  required for `--ble`:
+- Python 3.9 or newer with `pyserial`, `sounddevice`, `numpy`, and `pycaw`;
+  `bleak` is additionally required for `--ble`:
   `python -m pip install -r pc/requirements.txt`
+- `pycaw` lets the bridge temporarily unmute the Windows output, Stereo Mix, and
+  microphone during a voice session and restore their previous states afterwards.
 - WeType (the WeChat input method) installed as a TSF input method.
 - For board-microphone voice, Windows "Stereo Mix" enabled and set as the default
   recording device, and selected in WeType's voice settings.
@@ -105,7 +107,7 @@ that connects to `kfb24` can send the same commands as the bridge, so enable
 
 | Board action | PC effect |
 | --- | --- |
-| `voice` | Over USB, the board streams its microphone; the bridge plays it on the default output while holding the configured WeType hotkey (default `Ctrl+Win`). The next press stops both. On BLE/Wi-Fi only the hotkey is controlled. Use WeType voice input, not Windows `Win+H`. |
+| `voice` | Over USB, the board streams its microphone; the bridge plays it on the default output while holding the configured WeType hotkey (default `Ctrl+Win`). On BLE/Wi-Fi only, the bridge loops the PC microphone into the default output instead. The next press stops both. Use WeType voice input, not Windows `Win+H`. |
 | `ime` | Activates the WeType TSF profile (`{86598FB9-…}` / `{607FDF85-…}`, langid `0x0804`), falling back to the configured hotkey. |
 | `wechat` | Opens, restores, minimizes, or focuses a WeChat window, in that state order. |
 | `orca` | Opens, restores, minimizes, or focuses Orca. |
@@ -126,6 +128,17 @@ right-click the empty area, enable **Show Disabled Devices**, then right-click
 **Stereo Mix** and choose **Enable** and **Set as Default Device**. Select
 **Stereo Mix** in WeType's voice-input settings (or verify that **Auto detect**
 resolves to it).
+
+At the start of a voice session the bridge also unmutes the default output,
+Stereo Mix, and the physical microphone, raising a zero volume to 35%. A muted
+endpoint opens successfully in PortAudio but produces silence, which looks like
+a broken board. The bridge restores the previous mute and volume states when the
+session ends. This automatic repair needs `pycaw`; without it the bridge logs a
+warning and leaves endpoint states untouched.
+
+For BLE/Wi-Fi voice the bridge selects a real microphone (not Stereo Mix or a
+loopback device), plays it on the default output at 44.1/48 kHz, and holds the
+WeType hotkey. Set `pc_mic` or `pc_output` when the automatic choice is wrong.
 
 If `sounddevice` is missing or PortAudio cannot open the default output, the
 bridge logs the reason and still latches the WeType hotkey.
@@ -155,9 +168,15 @@ The bridge reads `%APPDATA%\kfb24\bridge.json` when present. Every key is option
   "voice_hotkey": "ctrl+win",
   "voice_mode": "latch",
   "voice_max_seconds": 60,
+  "pc_mic": "Microphone Array",
+  "pc_output": "Speakers",
   "ime_hotkey": "ctrl+space"
 }
 ```
+
+`pc_mic` and `pc_output` accept a device index or a case-insensitive name
+substring from `sounddevice.query_devices()`. They only affect the BLE/Wi-Fi
+microphone fallback; USB voice keeps using the board's PCM stream.
 
 `voice_mode` is `"latch"` by default: the first `voice` holds the shortcut, the
 second releases it. Set it to `"tap"` when WeType is configured for its
@@ -185,10 +204,14 @@ locally. `--verbose` prints board console logs and every protocol frame.
 - `voice` does nothing: focus a text field, set WeType to hold-to-talk, configure
   the same shortcut as `voice_hotkey`, and check that WeType is running. If
   WeType uses start/stop mode instead, set `"voice_mode": "tap"`.
-- `voice` transcribes silence or the PC microphone: the board audio is USB-only;
-  check `usb:` is the active route, enable Stereo Mix, set it as the default
-  recording device, and select it in WeType. Install `sounddevice` and read the
-  `audio:` line in the bridge log for playback errors.
+- `voice` transcribes silence: check the `audio:` lines. The bridge should print
+  `unmuted ...` when an endpoint was muted, then either `board PCM streaming`
+  (USB) or `PC microphone fallback: <mic> -> <output>` (BLE/Wi-Fi). Enable Stereo
+  Mix, set it as the default recording device, and select it in WeType. Install
+  `sounddevice`, `numpy`, and `pycaw`; without `pycaw` muted endpoints stay muted.
+- `voice` transcribes room noise instead of the board over USB: the board audio
+  is USB-only, but the selected route may still be BLE/Wi-Fi. Confirm `usb:` is
+  active, or use `pc_mic` to select a different fallback microphone.
 - `Ctrl`/`Win` stays down after `voice`: press the board `voice` action again, or
   wait for `voice_max_seconds`; the bridge also releases held keys on exit.
 - An app opens twice: close extra windows once; the bridge focuses the first
