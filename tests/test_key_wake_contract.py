@@ -33,6 +33,10 @@ class KeyWakeGuardWiringTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.main = read("main/main.c")
+        # The kfb24 application is a continuously powered console and does not
+        # enter deep sleep, so the wake-guard contract does not apply to it.
+        if "esp_deep_sleep_start" not in cls.main:
+            raise unittest.SkipTest("main.c has no deep-sleep key wake")
 
     def test_on_key_consumes_the_guard_before_the_readiness_check(self) -> None:
         # A release can arrive after the post-init voltage sample but before input

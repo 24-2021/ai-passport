@@ -17,6 +17,25 @@ Store reusable font files and generated font sources in `fonts/`.
 - Check Flash and internal-RAM impact before adding a font; the ESP32-C3 has no PSRAM.
 - Do not commit fonts whose license does not permit redistribution.
 
+### kfb24 Chinese fonts
+
+The kfb24 application bundles Noto Sans SC subsets at 14, 16, and 22 px. The generated sources live in `main/fonts/` because ESP-IDF builds them as component sources; the license stays in this directory.
+
+| File | Size and format | Use |
+| --- | --- | --- |
+| [`fonts/OFL.txt`](fonts/OFL.txt) | SIL Open Font License 1.1 | License for Noto Sans SC. |
+| `main/fonts/kfb24_14.c` | 14 px, 4 bpp, LVGL 9 C array | Hints, captions, footer, about rows. |
+| `main/fonts/kfb24_16.c` | 16 px, 4 bpp, LVGL 9 C array | Grid card labels and status text. |
+| `main/fonts/kfb24_22.c` | 22 px, 4 bpp, LVGL 9 C array | Hero title and page headings. |
+
+- Source: Noto Sans SC Regular from the [Noto CJK repository](https://github.com/notofonts/noto-cjk), used unchanged as the conversion input.
+- Character inventory: printable ASCII (`0x20`–`0x7E`), all CJK/kana/full-width characters found anywhere under `main/`, and common CJK punctuation. Scanning logs and comments as well as display strings keeps `tools/check_glyphs.py` green when text moves between them.
+- Regenerate after changing UI text, with Node.js and `npx` available:
+  `python3 tools/gen_kfb24_fonts.py --font /path/NotoSansSC-Regular.otf`
+  The converter (`lv_font_conv`) is pinned in `tools/requirements-fonts.txt`.
+- Destination: `main/fonts/`; `main/CMakeLists.txt` lists all three generated files. The C sources are committed, so a normal firmware build does not need Node.js or the OTF file.
+- RAM: the glyph bitmaps are `const` and stay in Flash; only the small `lv_font_t` descriptors and LVGL's glyph cache use internal RAM.
+
 ## Images
 
 Store reusable source images and generated display assets in `images/`.

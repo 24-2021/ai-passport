@@ -11,3 +11,10 @@ managed_components/
 /.agents/skills/passport-build
 /.agents/skills/passport-device-test
 /.agents/skills/passport-debug
+
+# kfb24 build and local bridge artifacts
+build*/
+sdkconfig.*
+!sdkconfig.defaults
+__pycache__/
+*.pyc

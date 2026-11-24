@@ -1,0 +1,811 @@
+#!/usr/bin/env python3
+"""kfb24 PC bridge: USB serial + Wi-Fi TCP control for the kfb24 board.
+
+The board sends one-line commands such as ``KFB24 CMD voice 7``.  This bridge
+executes them on Windows and acknowledges on the same transport.  It also sends
+heartbeats so the board can show whether the bridge is online, and accepts
+``--configure`` to provision Wi-Fi credentials over USB.
+
+Examples:
+    python pc/kfb24_bridge.py --list-ports
+    python pc/kfb24_bridge.py --port COM6 --tcp-port 8765
+    python pc/kfb24_bridge.py --configure --ssid MyWifi --password secret
+    python pc/kfb24_bridge.py --test-action voice --dry-run
+"""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from ctypes import wintypes
+from pathlib import Path
+from typing import Callable, Optional
+
+try:
+    import serial
+    from serial.tools import list_ports
+except ImportError:  # pragma: no cover - reported by main
+    serial = None
+    list_ports = None
+
+VERSION = "1.0.0"
+PREFIX = "KFB24 "
+DEFAULT_TCP_PORT = 8765
+DEFAULT_CONFIG = Path(os.environ.get("APPDATA", str(Path.home()))) / "kfb24" / "bridge.json"
+ESP_VID = 0x303A
+ESP_PID = 0x1001
+
+
+def log(message: str) -> None:
+    print(message, flush=True)
+
+
+def parse_frame(line: str) -> Optional[dict]:
+    if not line.startswith(PREFIX):
+        return None
+    parts = line.strip().split()
+    if len(parts) < 2 or parts[0] != "KFB24":
+        return None
+    kind = parts[1]
+    try:
+        if kind == "CMD" and len(parts) == 4:
+            return {"kind": kind, "name": parts[2], "id": int(parts[3], 10)}
+        if kind == "HELLO" and len(parts) in (2, 3):
+            return {"kind": kind, "version": parts[2] if len(parts) == 3 else ""}
+        if kind == "ACK" and len(parts) == 4:
+            return {"kind": kind, "id": int(parts[2], 10),
+                    "ok": parts[3] == "OK"}
+        if kind == "STATE" and len(parts) >= 4:
+            return {"kind": kind, "transport": parts[2],
+                    "up": parts[3] == "1",
+                    "detail": " ".join(parts[4:])}
+    except ValueError:
+        return None
+    return None
+
+
+def find_serial_port(explicit: Optional[str]) -> Optional[str]:
+    if explicit:
+        return explicit
+    if list_ports is None:
+        return None
+    candidates = []
+    for port in list_ports.comports():
+        if port.vid == ESP_VID and port.pid == ESP_PID:
+            candidates.append(port.device)
+    if candidates:
+        return sorted(candidates)[0]
+    for port in list_ports.comports():
+        text = f"{port.description or ''} {port.hwid or ''}".lower()
+        if "303a" in text or "usb serial" in text or "usb jtag" in text:
+            return port.device
+    return None
+
+
+def _candidate_ipv4s() -> list[str]:
+    """All local IPv4 addresses, including virtual adapters."""
+    values: list[str] = []
+    try:
+        for item in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            address = item[4][0]
+            if address not in values:
+                values.append(address)
+    except OSError:
+        pass
+    return values
+
+
+def _is_private(address: str) -> bool:
+    octets = [int(part) for part in address.split(".")]
+    return (octets[0] == 10 or
+            (octets[0] == 172 and 16 <= octets[1] <= 31) or
+            (octets[0] == 192 and octets[1] == 168))
+
+
+def _windows_default_ipv4() -> str | None:
+    """The IPv4 address of the adapter that owns the default route."""
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "(Get-NetIPConfiguration | Where-Object "
+             "{$_.IPv4DefaultGateway -ne $null} | Select-Object -First 1)"
+             ".IPv4Address.IPAddress"],
+            capture_output=True, text=True, timeout=8,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    address = result.stdout.strip().splitlines()[0].strip() if result.stdout.strip() else ""
+    return address or None
+
+
+def local_ipv4() -> str:
+    """Pick a LAN address the board can reach, not a VPN/WSL adapter."""
+    if IS_WINDOWS:
+        address = _windows_default_ipv4()
+        if address and _is_private(address):
+            return address
+    candidates = [a for a in _candidate_ipv4s()
+                  if not a.startswith(("127.", "169.254."))
+                  and not a.startswith("198.18.")]
+    candidates.sort(key=lambda a: (not a.startswith("192.168."),
+                                   not a.startswith("10."),
+                                   a.endswith(".1")))
+    if candidates:
+        return candidates[0]
+    return "127.0.0.1"
+
+
+# ---------------------------------------------------------------------------
+# Windows input and app launching
+# ---------------------------------------------------------------------------
+
+IS_WINDOWS = sys.platform == "win32"
+ULONG_PTR = ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong
+
+
+class GUID(ctypes.Structure):
+    _fields_ = [
+        ("Data1", wintypes.DWORD),
+        ("Data2", wintypes.WORD),
+        ("Data3", wintypes.WORD),
+        ("Data4", ctypes.c_ubyte * 8),
+    ]
+
+
+def make_guid(value: str) -> GUID:
+    parsed = uuid.UUID(value.strip().strip("{}"))
+    return GUID(parsed.fields[0], parsed.fields[1], parsed.fields[2],
+                (ctypes.c_ubyte * 8)(*parsed.bytes[8:]))
+
+
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk", wintypes.WORD),
+        ("wScan", wintypes.WORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ULONG_PTR),
+    ]
+
+
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = [
+        ("dx", wintypes.LONG),
+        ("dy", wintypes.LONG),
+        ("mouseData", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ULONG_PTR),
+    ]
+
+
+class HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [
+        ("uMsg", wintypes.DWORD),
+        ("wParamL", wintypes.WORD),
+        ("wParamH", wintypes.WORD),
+    ]
+
+
+class INPUT_UNION(ctypes.Union):
+    _fields_ = [("ki", KEYBDINPUT), ("mi", MOUSEINPUT), ("hi", HARDWAREINPUT)]
+
+
+class INPUT(ctypes.Structure):
+    _anonymous_ = ("u",)
+    _fields_ = [("type", wintypes.DWORD), ("u", INPUT_UNION)]
+
+
+INPUT_KEYBOARD = 1
+KEYEVENTF_KEYUP = 0x0002
+KEYEVENTF_EXTENDEDKEY = 0x0001
+
+VK_MODS = {"ctrl": 0x11, "control": 0x11, "alt": 0x12, "shift": 0x10,
+           "win": 0x5B, "windows": 0x5B}
+VK_KEYS = {"space": 0x20, "tab": 0x09, "enter": 0x0D, "return": 0x0D,
+           "esc": 0x1B, "escape": 0x1B, "h": 0x48}
+
+
+def _key_event(vk: int, up: bool, extended: bool = False) -> INPUT:
+    event = INPUT()
+    event.type = INPUT_KEYBOARD
+    event.ki.wVk = vk
+    event.ki.wScan = 0
+    event.ki.dwFlags = (KEYEVENTF_KEYUP if up else 0) | (
+        KEYEVENTF_EXTENDEDKEY if extended else 0)
+    event.ki.time = 0
+    event.ki.dwExtraInfo = 0
+    return event
+
+
+def _send_inputs(events: list[INPUT]) -> bool:
+    if not IS_WINDOWS:
+        log("input: Windows only")
+        return False
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
+    user32.SendInput.restype = wintypes.UINT
+    array = (INPUT * len(events))(*events)
+    sent = user32.SendInput(len(events), array, ctypes.sizeof(INPUT))
+    if sent != len(events):
+        log(f"input: SendInput sent {sent}/{len(events)} "
+            f"(error {ctypes.get_last_error()})")
+        return False
+    return True
+
+
+def send_win_h() -> bool:
+    events = [
+        _key_event(0x5B, False, True),
+        _key_event(0x48, False),
+        _key_event(0x48, True),
+        _key_event(0x5B, True, True),
+    ]
+    return _send_inputs(events)
+
+
+def send_hotkey(spec: str) -> bool:
+    parts = [part.strip().lower() for part in spec.split("+") if part.strip()]
+    if not parts:
+        return False
+    key = parts[-1]
+    vk = VK_KEYS.get(key)
+    if vk is None:
+        if len(key) == 1 and key.isalnum():
+            vk = ord(key.upper())
+        else:
+            log(f"input: unknown hotkey key {key!r}")
+            return False
+    events = []
+    for mod in parts[:-1]:
+        mod_vk = VK_MODS.get(mod)
+        if mod_vk is None:
+            log(f"input: unknown hotkey modifier {mod!r}")
+            return False
+        events.append(_key_event(mod_vk, False))
+    events.append(_key_event(vk, False))
+    events.append(_key_event(vk, True))
+    for mod in reversed(parts[:-1]):
+        events.append(_key_event(VK_MODS[mod], True))
+    return _send_inputs(events)
+
+
+def activate_input_profile(clsid: str, profile: str, langid: int) -> bool:
+    """Activate a TSF language profile (WeType has no legacy HKL)."""
+    if not IS_WINDOWS:
+        log("ime: Windows only")
+        return False
+    try:
+        ole32 = ctypes.WinDLL("ole32")
+        ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+        ole32.CoInitializeEx.restype = ctypes.c_long
+        init_hr = ole32.CoInitializeEx(None, 0x2)  # COINIT_APARTMENTTHREADED
+        if init_hr < 0:
+            log(f"ime: CoInitializeEx failed 0x{init_hr & 0xFFFFFFFF:08x}")
+            return False
+        try:
+            msctf = ctypes.WinDLL("msctf")
+            create = msctf.TF_CreateInputProcessorProfiles
+            create.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+            create.restype = ctypes.c_long
+            profiles = ctypes.c_void_p()
+            hr = create(ctypes.byref(profiles))
+            if hr != 0 or not profiles:
+                log(f"ime: TF_CreateInputProcessorProfiles failed "
+                    f"0x{hr & 0xFFFFFFFF:08x}")
+                return False
+            try:
+                vtable = ctypes.cast(
+                    profiles, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))
+                ).contents
+                activate = ctypes.WINFUNCTYPE(
+                    ctypes.c_long, ctypes.c_void_p,
+                    ctypes.POINTER(GUID), wintypes.WORD, ctypes.POINTER(GUID)
+                )(vtable[10])
+                clsid_guid = make_guid(clsid)
+                profile_guid = make_guid(profile)
+                # Signature is (clsid, langid, guidProfile); the langid comes
+                # before the profile GUID in msctf.h.
+                hr = activate(profiles, ctypes.byref(clsid_guid), langid,
+                              ctypes.byref(profile_guid))
+                if hr != 0:
+                    log(f"ime: ActivateLanguageProfile failed "
+                        f"0x{hr & 0xFFFFFFFF:08x}")
+                    return False
+                log(f"ime: activated {clsid} / {profile}")
+                return True
+            finally:
+                release = ctypes.WINFUNCTYPE(
+                    ctypes.c_ulong, ctypes.c_void_p)(vtable[2])
+                release(profiles)
+        finally:
+            if init_hr in (0, 1):
+                ole32.CoUninitialize()
+    except OSError as error:
+        log(f"ime: COM error: {error}")
+        return False
+
+
+DEFAULT_CONFIG_VALUES = {
+    "wechat": r"C:\Program Files\Tencent\Weixin\Weixin.exe",
+    "orca": str(Path(os.environ.get("LOCALAPPDATA", "")) /
+                "Programs" / "orca" / "Orca.exe"),
+    "terminal": "wt.exe",
+    "ime_clsid": "{86598FB9-66A2-463E-B9C2-AEB906D477AD}",
+    "ime_profile": "{607FDF85-FCC8-4DBD-A365-41296F980C9C}",
+    "ime_langid": 0x0804,
+    "ime_hotkey": "ctrl+space",
+}
+
+
+def load_config(path: Path) -> dict:
+    config = dict(DEFAULT_CONFIG_VALUES)
+    if path.is_file():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                config.update(loaded)
+        except (OSError, json.JSONDecodeError) as error:
+            log(f"config: ignoring {path}: {error}")
+    return config
+
+
+class Actions:
+    def __init__(self, config: dict, dry_run: bool = False):
+        self.config = config
+        self.dry_run = dry_run
+
+    def launch(self, name: str) -> bool:
+        path = str(self.config.get(name, ""))
+        if self.dry_run:
+            log(f"dry-run: launch {name}: {path or '<missing>'}")
+            return True
+        if not path:
+            log(f"launch: no path configured for {name}")
+            return False
+        expanded = os.path.expandvars(os.path.expanduser(path))
+        if os.path.isfile(expanded):
+            try:
+                subprocess.Popen(
+                    [expanded], cwd=os.path.dirname(expanded) or None,
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, close_fds=True,
+                )
+                log(f"launch: {name}: {expanded}")
+                return True
+            except OSError as error:
+                log(f"launch: {name} failed: {error}")
+                return False
+        executable = shutil.which(expanded)
+        if executable:
+            try:
+                subprocess.Popen(
+                    [executable], stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    close_fds=True,
+                )
+                log(f"launch: {name}: {executable}")
+                return True
+            except OSError as error:
+                log(f"launch: {name} failed: {error}")
+                return False
+        log(f"launch: {name} not found: {path}")
+        return False
+
+    def ime(self) -> bool:
+        if self.dry_run:
+            log("dry-run: activate WeType TSF profile")
+            return True
+        ok = activate_input_profile(
+            str(self.config["ime_clsid"]),
+            str(self.config["ime_profile"]),
+            int(self.config["ime_langid"]),
+        )
+        if ok:
+            return True
+        fallback = str(self.config.get("ime_hotkey", ""))
+        if fallback:
+            log(f"ime: falling back to hotkey {fallback}")
+            return send_hotkey(fallback)
+        return False
+
+    def voice(self) -> bool:
+        if self.dry_run:
+            log("dry-run: send Win+H")
+            return True
+        return send_win_h()
+
+    def run(self, name: str) -> bool:
+        if name == "voice":
+            return self.voice()
+        if name == "ime":
+            return self.ime()
+        if name in ("wechat", "orca", "terminal"):
+            return self.launch(name)
+        log(f"action: unknown command {name!r}")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Transports
+# ---------------------------------------------------------------------------
+
+class SerialTransport:
+    def __init__(self, port: str, on_line: Callable[[str, "SerialTransport"], None],
+                 verbose: bool = False):
+        self.port = port
+        self.on_line = on_line
+        self.verbose = verbose
+        self.ser = serial.Serial()
+        self.ser.port = port
+        self.ser.baudrate = 115200
+        self.ser.timeout = 0.2
+        self.ser.dtr = False
+        self.ser.rts = False
+        self._write_lock = threading.Lock()
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+
+    def open(self) -> None:
+        self.ser.open()
+        try:
+            self.ser.dtr = False
+            self.ser.rts = False
+        except (OSError, serial.SerialException):
+            pass
+
+    def start(self) -> None:
+        self._running = True
+        self._thread = threading.Thread(target=self._read_loop, daemon=True)
+        self._thread.start()
+
+    def _read_loop(self) -> None:
+        while self._running:
+            try:
+                raw = self.ser.readline()
+            except (OSError, serial.SerialException) as error:
+                if self._running:
+                    log(f"serial: read failed: {error}")
+                break
+            if not raw:
+                continue
+            line = raw.decode("utf-8", errors="replace").strip()
+            if line:
+                self.on_line(line, self)
+
+    def send(self, line: str) -> bool:
+        if not self.ser.is_open:
+            return False
+        try:
+            with self._write_lock:
+                self.ser.write((line + "\n").encode("utf-8"))
+                self.ser.flush()
+            return True
+        except (OSError, serial.SerialException) as error:
+            log(f"serial: write failed: {error}")
+            return False
+
+    def label(self) -> str:
+        return f"USB({self.port})"
+
+    def close(self) -> None:
+        self._running = False
+        try:
+            self.ser.close()
+        except (OSError, serial.SerialException):
+            pass
+
+
+class TcpTransport:
+    def __init__(self, conn: socket.socket, peer, on_line,
+                 verbose: bool = False):
+        self.conn = conn
+        self.peer = peer
+        self.on_line = on_line
+        self.verbose = verbose
+        self._write_lock = threading.Lock()
+        self._running = True
+
+    def send(self, line: str) -> bool:
+        try:
+            with self._write_lock:
+                self.conn.sendall((line + "\n").encode("utf-8"))
+            return True
+        except OSError:
+            return False
+
+    def label(self) -> str:
+        return f"WiFi({self.peer[0]}:{self.peer[1]})"
+
+    def close(self) -> None:
+        self._running = False
+        try:
+            self.conn.close()
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Bridge
+# ---------------------------------------------------------------------------
+
+class Bridge:
+    def __init__(self, actions: Actions, serial_port: Optional[str],
+                 tcp_port: int, listen: str, verbose: bool = False,
+                 enable_tcp: bool = True):
+        self.actions = actions
+        self.verbose = verbose
+        self.serial: Optional[SerialTransport] = None
+        self.tcp: Optional[TcpTransport] = None
+        self.tcp_lock = threading.Lock()
+        self.running = True
+        self.board_hello = threading.Event()
+        self.ack_event = threading.Event()
+        self.ack_ok = False
+        self.ack_id: Optional[int] = None
+        self.server = None
+        self._heartbeat: Optional[threading.Thread] = None
+        self._tcp_port = tcp_port
+        self._listen = listen
+        self._enable_tcp = enable_tcp
+        if serial_port:
+            if serial is None:
+                raise RuntimeError("pyserial is not installed")
+            self.serial = SerialTransport(serial_port, self.on_line, verbose)
+            self.serial.open()
+            self.serial.start()
+            log(f"serial: {serial_port} @ 115200")
+        if enable_tcp:
+            self._start_tcp_server()
+
+    def _start_tcp_server(self) -> None:
+        bridge = self
+
+        class Handler(__import__("socketserver").StreamRequestHandler):
+            def handle(self) -> None:
+                transport = TcpTransport(self.request, self.client_address,
+                                         bridge.on_line, bridge.verbose)
+                try:
+                    self.request.settimeout(1.0)
+                    bridge.attach_tcp(transport)
+                    while bridge.running and transport._running:
+                        try:
+                            raw = self.request.recv(1024)
+                        except socket.timeout:
+                            continue
+                        except OSError:
+                            break
+                        if not raw:
+                            break
+                        for line in raw.decode("utf-8", errors="replace").splitlines():
+                            if line.strip():
+                                bridge.on_line(line.strip(), transport)
+                finally:
+                    bridge.detach_tcp(transport)
+                    transport.close()
+
+        class Server(__import__("socketserver").ThreadingTCPServer):
+            allow_reuse_address = True
+            daemon_threads = True
+
+        try:
+            self.server = Server((self._listen, self._tcp_port), Handler)
+        except OSError as error:
+            raise RuntimeError(f"TCP listen failed on {self._listen}:{self._tcp_port}: {error}")
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        log(f"tcp: listening on {self._listen}:{self._tcp_port} "
+            f"(LAN {local_ipv4()}:{self._tcp_port})")
+
+    def attach_tcp(self, transport: TcpTransport) -> None:
+        with self.tcp_lock:
+            old = self.tcp
+            self.tcp = transport
+        if old:
+            old.close()
+        log(f"tcp: board connected from {transport.peer[0]}:{transport.peer[1]}")
+        self.send_line(transport, f"KFB24 HELLO bridge/{VERSION}")
+
+    def detach_tcp(self, transport: TcpTransport) -> None:
+        with self.tcp_lock:
+            if self.tcp is transport:
+                self.tcp = None
+                log(f"tcp: board disconnected {transport.peer[0]}:{transport.peer[1]}")
+
+    def send_line(self, transport, line: str) -> bool:
+        ok = transport.send(line)
+        if self.verbose:
+            log(f"{transport.label()} -> {line}")
+        return ok
+
+    def send_all(self, line: str) -> None:
+        if self.serial:
+            self.send_line(self.serial, line)
+        with self.tcp_lock:
+            tcp = self.tcp
+        if tcp:
+            self.send_line(tcp, line)
+
+    def on_line(self, line: str, transport) -> None:
+        frame = parse_frame(line)
+        if frame is None:
+            if self.verbose:
+                log(f"{transport.label()} | {line}")
+            return
+        kind = frame["kind"]
+        if kind == "HELLO":
+            self.board_hello.set()
+            log(f"{transport.label()} <- board hello {frame['version']}")
+        elif kind == "STATE":
+            log(f"{transport.label()} <- state {frame['transport']} "
+                f"{'up' if frame['up'] else 'down'} {frame['detail']}".rstrip())
+        elif kind == "ACK":
+            log(f"{transport.label()} <- ack {frame['id']} "
+                f"{'OK' if frame['ok'] else 'ERR'}")
+            if frame["id"] == self.ack_id:
+                self.ack_ok = frame["ok"]
+                self.ack_event.set()
+        elif kind == "CMD":
+            log(f"{transport.label()} <- cmd {frame['name']} #{frame['id']}")
+            ok = False
+            try:
+                ok = self.actions.run(frame["name"])
+            except Exception as error:  # action failures must still ACK
+                log(f"action {frame['name']} raised: {error}")
+            self.send_line(transport, f"KFB24 ACK {frame['id']} "
+                                      f"{'OK' if ok else 'ERR'}")
+
+    def start_heartbeat(self) -> None:
+        def beat() -> None:
+            while self.running:
+                self.send_all(f"KFB24 HELLO bridge/{VERSION}")
+                time.sleep(2.0)
+
+        self._heartbeat = threading.Thread(target=beat, daemon=True)
+        self._heartbeat.start()
+
+    def configure(self, ssid: str, password: str, host: str, port: int,
+                  timeout: float = 8.0) -> bool:
+        if not self.serial:
+            log("configure: USB serial is required")
+            return False
+        if not ssid:
+            log("configure: SSID must not be empty")
+            return False
+        self.ack_event.clear()
+        self.ack_id = 1
+        self.ack_ok = False
+        ssid_hex = ssid.encode("utf-8").hex()
+        pass_hex = password.encode("utf-8").hex() if password else "-"
+        host_value = host or "-"
+        line = f"KFB24 CFG 1 {ssid_hex} {pass_hex} {host_value} {port}"
+        log(f"configure: ssid={ssid!r} bridge={host_value}:{port}")
+        self.send_line(self.serial, line)
+        if not self.ack_event.wait(timeout):
+            log("configure: no ACK from board")
+            return False
+        log(f"configure: board {'saved' if self.ack_ok else 'rejected'} the settings")
+        return self.ack_ok
+
+    def stop(self) -> None:
+        self.running = False
+        if self.server:
+            self.server.shutdown()
+            self.server.server_close()
+        with self.tcp_lock:
+            tcp = self.tcp
+            self.tcp = None
+        if tcp:
+            tcp.close()
+        if self.serial:
+            self.serial.close()
+        log("bridge: stopped")
+
+
+def list_serial_ports() -> None:
+    if list_ports is None:
+        log("pyserial is not installed: python -m pip install -r pc/requirements.txt")
+        return
+    for port in list_ports.comports():
+        marker = " <- board" if port.vid == ESP_VID and port.pid == ESP_PID else ""
+        log(f"{port.device}: {port.description} [{port.hwid}]{marker}")
+
+
+def run_configure(args, config: dict) -> int:
+    port = find_serial_port(args.port)
+    if not port:
+        log("configure: no ESP32 USB serial port found; use --port COMx")
+        return 2
+    actions = Actions(config, dry_run=True)
+    bridge = Bridge(actions, port, args.tcp_port, args.listen, args.verbose,
+                    enable_tcp=False)
+    try:
+        log("configure: waiting for the board to boot...")
+        bridge.board_hello.wait(12.0)
+        host = args.host or local_ipv4()
+        ok = bridge.configure(args.ssid, args.password or "", host, args.tcp_port)
+        return 0 if ok else 1
+    finally:
+        bridge.stop()
+
+
+def run_bridge(args, config: dict) -> int:
+    port = find_serial_port(args.port)
+    if not port and args.port:
+        log(f"serial: {args.port} not found")
+        return 2
+    if not port:
+        log("serial: board not found; continuing with Wi-Fi/TCP only")
+    actions = Actions(config, dry_run=args.dry_run)
+    try:
+        bridge = Bridge(actions, port, args.tcp_port, args.listen, args.verbose)
+    except Exception as error:
+        log(f"bridge: {error}")
+        return 2
+    bridge.start_heartbeat()
+    log("bridge: ready for voice/ime/wechat/orca/terminal")
+    try:
+        while True:
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        log("bridge: interrupted")
+    finally:
+        bridge.stop()
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--port", help="serial port (auto-detect Espressif by default)")
+    parser.add_argument("--tcp-port", type=int, default=DEFAULT_TCP_PORT,
+                        help=f"bridge TCP port (default {DEFAULT_TCP_PORT})")
+    parser.add_argument("--listen", default="0.0.0.0",
+                        help="TCP listen address (default 0.0.0.0)")
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG,
+                        help=f"JSON config (default {DEFAULT_CONFIG})")
+    parser.add_argument("--verbose", action="store_true",
+                        help="print board logs and every protocol frame")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="do not send input or launch apps")
+    parser.add_argument("--list-ports", action="store_true",
+                        help="list serial ports and exit")
+    parser.add_argument("--configure", action="store_true",
+                        help="send Wi-Fi/bridge settings over USB and exit")
+    parser.add_argument("--ssid", help="Wi-Fi SSID for --configure")
+    parser.add_argument("--password", help="Wi-Fi password for --configure")
+    parser.add_argument("--host", help="PC IPv4 address advertised to the board")
+    parser.add_argument("--test-action", choices=["voice", "ime", "wechat", "orca",
+                                                   "terminal"],
+                        help="run one action locally and exit")
+    args = parser.parse_args()
+
+    if args.list_ports:
+        list_serial_ports()
+        return 0
+    if serial is None and not args.test_action:
+        log("pyserial is missing: python -m pip install -r pc/requirements.txt")
+        return 2
+
+    config = load_config(args.config)
+    if args.test_action:
+        ok = Actions(config, dry_run=args.dry_run).run(args.test_action)
+        return 0 if ok else 1
+    if args.configure:
+        if not args.ssid:
+            parser.error("--configure requires --ssid")
+        return run_configure(args, config)
+    return run_bridge(args, config)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

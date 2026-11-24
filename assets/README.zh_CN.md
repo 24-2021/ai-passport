@@ -15,6 +15,25 @@
 - 添加字库前评估 Flash 与内部 RAM 影响；ESP32-C3 无 PSRAM。
 - 不提交许可不允许分发的字库。
 
+### kfb24 中文字库
+
+kfb24 应用内置 Noto Sans SC 的 14、16、22 px 子集。生成的字库源码放在 `main/fonts/`，因为 ESP-IDF 要把它作为组件源码编译；许可文本保留在本目录。
+
+| 文件 | 尺寸与格式 | 用途 |
+| --- | --- | --- |
+| [`fonts/OFL.txt`](fonts/OFL.txt) | SIL Open Font License 1.1 | Noto Sans SC 的许可。 |
+| `main/fonts/kfb24_14.c` | 14 px，4 bpp，LVGL 9 C 数组 | 提示、说明、页脚、关于页行。 |
+| `main/fonts/kfb24_16.c` | 16 px，4 bpp，LVGL 9 C 数组 | 网格卡片标题与状态文字。 |
+| `main/fonts/kfb24_22.c` | 22 px，4 bpp，LVGL 9 C 数组 | 主卡片标题与页面标题。 |
+
+- 来源：[Noto CJK 仓库](https://github.com/notofonts/noto-cjk) 的 Noto Sans SC Regular，转换输入未作修改。
+- 字符集：可打印 ASCII（`0x20`–`0x7E`）、`main/` 下出现的全部 CJK/假名/全角字符，以及常用中文标点。日志与注释也一起扫描，这样文字在日志和控件之间移动时 `tools/check_glyphs.py` 仍然通过。
+- 修改界面文字后重新生成，需要 Node.js 与 `npx`：
+  `python3 tools/gen_kfb24_fonts.py --font /path/NotoSansSC-Regular.otf`
+  转换器（`lv_font_conv`）版本固定在 `tools/requirements-fonts.txt`。
+- 目标路径：`main/fonts/`；`main/CMakeLists.txt` 已列出三个生成文件。C 源码随仓库提交，普通固件构建不需要 Node.js 或 OTF 文件。
+- RAM：字形位图是 `const`，留在 Flash；只有很小的 `lv_font_t` 描述符和 LVGL 字形缓存占用内部 RAM。
+
 ## 图片（images）
 
 可复用的源图与生成的显示资产放在 `images/`。
