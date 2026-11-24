@@ -12,13 +12,12 @@
 #include <string.h>
 
 #define COL_BG 0x0B0F14
-#define COL_SURFACE 0x121A21
 #define COL_SURFACE_HI 0x17252D
 #define COL_BORDER 0x1E2A33
 #define COL_TEXT 0xE8F0F4
+#define COL_TEXT_DIM 0xAEBCC6
 #define COL_MUTED 0x7C8B96
 #define COL_ACCENT 0x5EEAD4
-#define COL_ACCENT_DARK 0x07221F
 #define COL_WARNING 0xF2B84B
 #define COL_ERROR 0xF26D6D
 
@@ -49,7 +48,8 @@ static lv_obj_t *s_transport;
 static lv_obj_t *s_batt_icon;
 static lv_obj_t *s_batt_pct;
 static lv_obj_t *s_hint;
-static lv_obj_t *s_cards[KFB24_ACTION_COUNT];
+static lv_obj_t *s_rows[KFB24_ACTION_COUNT];
+static lv_obj_t *s_bars[KFB24_ACTION_COUNT];
 static lv_obj_t *s_icons[KFB24_ACTION_COUNT];
 static lv_obj_t *s_names[KFB24_ACTION_COUNT];
 static lv_obj_t *s_about;
@@ -74,32 +74,43 @@ static lv_obj_t *make_label(lv_obj_t *parent, const char *text,
     return label;
 }
 
-static lv_obj_t *make_card(lv_obj_t *parent, int x, int y, int w, int h,
-                           const char *icon, const char *name, int index) {
-    lv_obj_t *card = lv_obj_create(parent);
-    lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_pos(card, x, y);
-    lv_obj_set_size(card, w, h);
-    lv_obj_set_style_radius(card, 14, 0);
-    lv_obj_set_style_bg_color(card, lv_color_hex(COL_SURFACE), 0);
-    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_color(card, lv_color_hex(COL_BORDER), 0);
-    lv_obj_set_style_border_width(card, 1, 0);
-    lv_obj_set_style_border_side(card, LV_BORDER_SIDE_FULL, 0);
-    lv_obj_set_style_outline_width(card, 0, 0);
-    lv_obj_set_style_shadow_width(card, 0, 0);
-    lv_obj_set_style_pad_all(card, 0, 0);
+static lv_obj_t *make_row(lv_obj_t *parent, int y,
+                          const char *icon, const char *name, int index) {
+    lv_obj_t *row = lv_obj_create(parent);
+    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_pos(row, 4, y);
+    lv_obj_set_size(row, 232, 30);
+    lv_obj_set_style_radius(row, 0, 0);
+    lv_obj_set_style_bg_color(row, lv_color_hex(COL_SURFACE_HI), 0);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_set_style_outline_width(row, 0, 0);
+    lv_obj_set_style_shadow_width(row, 0, 0);
+    lv_obj_set_style_pad_all(row, 0, 0);
 
-    lv_obj_t *icon_label = make_label(card, icon, &kfb24_font_16, COL_MUTED, 9, 3);
-    lv_obj_t *name_label = make_label(card, name, &kfb24_font_14, COL_TEXT, 8, 24);
-    lv_obj_set_width(name_label, 90);
+    lv_obj_t *bar = lv_obj_create(row);
+    lv_obj_remove_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_pos(bar, 0, 7);
+    lv_obj_set_size(bar, 3, 16);
+    lv_obj_set_style_radius(bar, 0, 0);
+    lv_obj_set_style_bg_color(bar, lv_color_hex(COL_BORDER), 0);
+    lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(bar, 0, 0);
+    lv_obj_set_style_pad_all(bar, 0, 0);
+
+    lv_obj_t *icon_label = make_label(row, icon, &kfb24_font_16, COL_MUTED, 12, 6);
+    lv_obj_set_width(icon_label, 20);
+    lv_obj_t *name_label = make_label(row, name, &kfb24_font_14,
+                                      COL_TEXT_DIM, 36, 7);
+    lv_obj_set_width(name_label, 188);
     lv_label_set_long_mode(name_label, LV_LABEL_LONG_CLIP);
 
-    s_cards[index] = card;
+    s_rows[index] = row;
+    s_bars[index] = bar;
     s_icons[index] = icon_label;
     s_names[index] = name_label;
-    return card;
+    return row;
 }
 static void set_hint(const char *text, uint32_t color) {
     if (!s_hint) return;
@@ -140,16 +151,16 @@ static void default_hint(const kfb24_link_status_t *st) {
 
 static void refresh_selection(void) {
     for (int i = 0; i < KFB24_ACTION_COUNT; i++) {
-        if (!s_cards[i]) continue;
+        if (!s_rows[i]) continue;
         bool selected = i == s_selected;
-        lv_obj_set_style_border_width(s_cards[i], selected ? 2 : 1, 0);
-        lv_obj_set_style_border_color(
-            s_cards[i], lv_color_hex(selected ? COL_ACCENT : COL_BORDER), 0);
-        lv_obj_set_style_bg_color(
-            s_cards[i], lv_color_hex(selected ? COL_SURFACE_HI : COL_SURFACE), 0);
+        lv_obj_set_style_bg_opa(s_rows[i],
+                                selected ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+        lv_obj_set_style_bg_color(s_bars[i],
+                                  lv_color_hex(selected ? COL_ACCENT : COL_BORDER), 0);
         lv_obj_set_style_text_color(
             s_icons[i], lv_color_hex(selected ? COL_ACCENT : COL_MUTED), 0);
-        lv_obj_set_style_text_color(s_names[i], lv_color_hex(COL_TEXT), 0);
+        lv_obj_set_style_text_color(
+            s_names[i], lv_color_hex(selected ? COL_TEXT : COL_TEXT_DIM), 0);
     }
 }
 
@@ -319,8 +330,8 @@ static void about_close(void) {
 
 static lv_obj_t *about_row(lv_obj_t *parent, const char *name, int y) {
     make_label(parent, name, &kfb24_font_14, COL_MUTED, 16, y);
-    lv_obj_t *value = make_label(parent, "--", &kfb24_font_14, COL_TEXT, 72, y);
-    lv_obj_set_width(value, 116);
+    lv_obj_t *value = make_label(parent, "--", &kfb24_font_14, COL_TEXT, 76, y);
+    lv_obj_set_width(value, 148);
     lv_obj_set_style_text_align(value, LV_TEXT_ALIGN_RIGHT, 0);
     lv_label_set_long_mode(value, LV_LABEL_LONG_DOT);
     return value;
@@ -337,47 +348,46 @@ static void about_open(void) {
     lv_obj_set_style_radius(overlay, 0, 0);
     lv_obj_set_style_border_width(overlay, 0, 0);
     lv_obj_set_style_pad_all(overlay, 0, 0);
-    lv_obj_set_style_bg_color(overlay, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_bg_opa(overlay, 180, 0);
+    lv_obj_set_style_bg_color(overlay, lv_color_hex(COL_BG), 0);
+    lv_obj_set_style_bg_opa(overlay, LV_OPA_COVER, 0);
 
-    lv_obj_t *card = lv_obj_create(overlay);
-    lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_pos(card, 18, 42);
-    lv_obj_set_size(card, 204, 236);
-    lv_obj_set_style_radius(card, 22, 0);
-    lv_obj_set_style_bg_color(card, lv_color_hex(COL_SURFACE), 0);
-    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(card, 1, 0);
-    lv_obj_set_style_border_color(card, lv_color_hex(COL_BORDER), 0);
-    lv_obj_set_style_pad_all(card, 0, 0);
+    make_label(overlay, "关于", &kfb24_font_22, COL_TEXT, 16, 14);
+    lv_obj_t *version = make_label(overlay, "kfb24 1.0.0",
+                                   &lv_font_montserrat_14, COL_MUTED, 16, 46);
+    lv_obj_set_width(version, 208);
+    lv_obj_set_style_text_align(version, LV_TEXT_ALIGN_RIGHT, 0);
 
-    make_label(card, "关于 kfb24", &kfb24_font_22, COL_TEXT, 16, 12);
-    s_about_values[0] = about_row(card, "连接", 50);
-    s_about_values[1] = about_row(card, "BLE", 72);
-    s_about_values[2] = about_row(card, "网络", 94);
-    s_about_values[3] = about_row(card, "地址", 116);
-    s_about_values[4] = about_row(card, "电量", 138);
-    s_about_values[5] = about_row(card, "固件", 160);
-
-    lv_obj_t *divider = lv_obj_create(card);
+    lv_obj_t *divider = lv_obj_create(overlay);
     lv_obj_remove_flag(divider, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_pos(divider, 16, 184);
-    lv_obj_set_size(divider, 172, 1);
+    lv_obj_set_pos(divider, 16, 68);
+    lv_obj_set_size(divider, 208, 1);
     lv_obj_set_style_radius(divider, 0, 0);
     lv_obj_set_style_border_width(divider, 0, 0);
     lv_obj_set_style_bg_color(divider, lv_color_hex(COL_BORDER), 0);
     lv_obj_set_style_bg_opa(divider, LV_OPA_COVER, 0);
     lv_obj_set_style_pad_all(divider, 0, 0);
 
-    lv_obj_t *by = make_label(card, "by 24", &lv_font_montserrat_14,
-                              COL_ACCENT, 0, 190);
-    lv_obj_set_width(by, 204);
-    lv_obj_set_style_text_align(by, LV_TEXT_ALIGN_CENTER, 0);
+    s_about_values[0] = about_row(overlay, "连接", 84);
+    s_about_values[1] = about_row(overlay, "BLE", 114);
+    s_about_values[2] = about_row(overlay, "网络", 144);
+    s_about_values[3] = about_row(overlay, "地址", 174);
+    s_about_values[4] = about_row(overlay, "电量", 204);
+    s_about_values[5] = about_row(overlay, "固件", 234);
 
-    lv_obj_t *close = make_label(card, "按 OK 关闭", &kfb24_font_14,
-                                 COL_MUTED, 0, 210);
-    lv_obj_set_width(close, 204);
-    lv_obj_set_style_text_align(close, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_t *rule = lv_obj_create(overlay);
+    lv_obj_remove_flag(rule, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_pos(rule, 16, 276);
+    lv_obj_set_size(rule, 208, 1);
+    lv_obj_set_style_radius(rule, 0, 0);
+    lv_obj_set_style_border_width(rule, 0, 0);
+    lv_obj_set_style_bg_color(rule, lv_color_hex(COL_BORDER), 0);
+    lv_obj_set_style_bg_opa(rule, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(rule, 0, 0);
+
+    lv_obj_t *close = make_label(overlay, "按 OK 关闭", &kfb24_font_14,
+                                 COL_MUTED, 16, 288);
+    lv_obj_set_width(close, 208);
+    lv_obj_set_style_text_align(close, LV_TEXT_ALIGN_RIGHT, 0);
 
     s_about = overlay;
     update_status();
@@ -423,65 +433,62 @@ static void splash_done(lv_timer_t *timer) {
     lv_obj_set_style_bg_opa(home, LV_OPA_COVER, 0);
     lv_obj_set_style_pad_all(home, 0, 0);
 
-    lv_obj_t *wordmark = make_label(home, "kfb24", &lv_font_montserrat_20,
-                                    COL_ACCENT, 16, 8);
+    lv_obj_t *wordmark = make_label(home, "kfb24", &lv_font_montserrat_16,
+                                    COL_ACCENT, 14, 5);
     lv_obj_set_style_text_letter_space(wordmark, 1, 0);
 
     s_dot = lv_obj_create(home);
     lv_obj_remove_flag(s_dot, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_pos(s_dot, 84, 20);
-    lv_obj_set_size(s_dot, 8, 8);
-    lv_obj_set_style_radius(s_dot, 4, 0);
+    lv_obj_set_pos(s_dot, 62, 13);
+    lv_obj_set_size(s_dot, 6, 6);
+    lv_obj_set_style_radius(s_dot, 3, 0);
     lv_obj_set_style_border_width(s_dot, 0, 0);
     lv_obj_set_style_bg_color(s_dot, lv_color_hex(COL_MUTED), 0);
     lv_obj_set_style_bg_opa(s_dot, LV_OPA_COVER, 0);
 
-    s_transport = make_label(home, "--", &lv_font_montserrat_14, COL_MUTED, 96, 12);
-    lv_obj_set_width(s_transport, 48);
+    s_transport = make_label(home, "--", &lv_font_montserrat_14, COL_MUTED, 72, 5);
+    lv_obj_set_width(s_transport, 60);
 
-    lv_obj_t *battery = lv_obj_create(home);
-    lv_obj_remove_flag(battery, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_pos(battery, 154, 12);
-    lv_obj_set_size(battery, 72, 22);
-    lv_obj_set_style_radius(battery, 11, 0);
-    lv_obj_set_style_bg_color(battery, lv_color_hex(COL_SURFACE), 0);
-    lv_obj_set_style_bg_opa(battery, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(battery, 1, 0);
-    lv_obj_set_style_border_color(battery, lv_color_hex(COL_BORDER), 0);
-    lv_obj_set_style_pad_all(battery, 0, 0);
-    s_batt_icon = make_label(battery, LV_SYMBOL_BATTERY_EMPTY,
-                             &lv_font_montserrat_14, COL_TEXT, 8, 3);
-    s_batt_pct = make_label(battery, "--", &lv_font_montserrat_14, COL_TEXT, 26, 3);
-    lv_obj_set_width(s_batt_pct, 38);
+    s_batt_icon = make_label(home, LV_SYMBOL_BATTERY_EMPTY,
+                             &lv_font_montserrat_14, COL_TEXT, 152, 5);
+    s_batt_pct = make_label(home, "--", &lv_font_montserrat_14, COL_TEXT, 170, 5);
+    lv_obj_set_width(s_batt_pct, 54);
     lv_obj_set_style_text_align(s_batt_pct, LV_TEXT_ALIGN_RIGHT, 0);
-
-    make_label(home, "快捷控制", &kfb24_font_22, COL_TEXT, 16, 36);
-    s_hint = make_label(home, "PC COMMAND CONSOLE", &kfb24_font_14, COL_MUTED, 16, 62);
-    lv_obj_set_width(s_hint, 208);
-    lv_label_set_long_mode(s_hint, LV_LABEL_LONG_DOT);
-
-    for (int i = 0; i < KFB24_ACTION_COUNT; i++) {
-        int col = i % 2;
-        int row = i / 2;
-        lv_obj_t *card = make_card(home, 12 + col * 110, 84 + row * 52,
-                                   106, 48, ICONS[i], NAMES[i], i);
-        lv_obj_add_event_cb(card, card_clicked, LV_EVENT_CLICKED,
-                            (void *)(intptr_t)i);
-    }
 
     lv_obj_t *rule = lv_obj_create(home);
     lv_obj_remove_flag(rule, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_pos(rule, 24, 292);
-    lv_obj_set_size(rule, 192, 1);
+    lv_obj_set_pos(rule, 12, 30);
+    lv_obj_set_size(rule, 216, 1);
     lv_obj_set_style_radius(rule, 0, 0);
     lv_obj_set_style_border_width(rule, 0, 0);
     lv_obj_set_style_bg_color(rule, lv_color_hex(COL_BORDER), 0);
     lv_obj_set_style_bg_opa(rule, LV_OPA_COVER, 0);
     lv_obj_set_style_pad_all(rule, 0, 0);
 
-    make_label(home, "OK 执行 · 长按 关于", &kfb24_font_14, COL_MUTED, 16, 297);
+    for (int i = 0; i < KFB24_ACTION_COUNT; i++) {
+        lv_obj_t *row = make_row(home, 36 + i * 30,
+                                 ICONS[i], NAMES[i], i);
+        lv_obj_add_event_cb(row, card_clicked, LV_EVENT_CLICKED,
+                            (void *)(intptr_t)i);
+    }
+
+    s_hint = make_label(home, "", &kfb24_font_14, COL_MUTED, 12, 277);
+    lv_obj_set_width(s_hint, 216);
+    lv_label_set_long_mode(s_hint, LV_LABEL_LONG_DOT);
+
+    lv_obj_t *foot_rule = lv_obj_create(home);
+    lv_obj_remove_flag(foot_rule, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_pos(foot_rule, 12, 298);
+    lv_obj_set_size(foot_rule, 216, 1);
+    lv_obj_set_style_radius(foot_rule, 0, 0);
+    lv_obj_set_style_border_width(foot_rule, 0, 0);
+    lv_obj_set_style_bg_color(foot_rule, lv_color_hex(COL_BORDER), 0);
+    lv_obj_set_style_bg_opa(foot_rule, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(foot_rule, 0, 0);
+
+    make_label(home, "OK 执行 · 长按 关于", &kfb24_font_14, COL_MUTED, 12, 301);
     lv_obj_t *by = make_label(home, "by 24", &lv_font_montserrat_14,
-                              COL_ACCENT, 184, 297);
+                              COL_ACCENT, 188, 301);
     lv_obj_set_width(by, 40);
     lv_obj_set_style_text_align(by, LV_TEXT_ALIGN_RIGHT, 0);
 
@@ -502,35 +509,15 @@ static lv_obj_t *make_splash(void) {
     lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
     lv_obj_set_style_pad_all(screen, 0, 0);
 
-    lv_obj_t *logo = lv_obj_create(screen);
-    lv_obj_remove_flag(logo, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_pos(logo, 88, 52);
-    lv_obj_set_size(logo, 64, 64);
-    lv_obj_set_style_radius(logo, 20, 0);
-    lv_obj_set_style_bg_color(logo, lv_color_hex(COL_ACCENT), 0);
-    lv_obj_set_style_bg_opa(logo, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(logo, 0, 0);
-    lv_obj_set_style_pad_all(logo, 0, 0);
-    lv_obj_t *mark = make_label(logo, "24", &lv_font_montserrat_28,
-                                COL_ACCENT_DARK, 0, 14);
-    lv_obj_set_width(mark, 64);
-    lv_obj_set_style_text_align(mark, LV_TEXT_ALIGN_CENTER, 0);
-
     lv_obj_t *name = make_label(screen, "kfb24", &lv_font_montserrat_28,
-                                COL_TEXT, 0, 132);
+                                COL_TEXT, 0, 122);
     lv_obj_set_width(name, SCREEN_W);
     lv_obj_set_style_text_align(name, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_letter_space(name, 2, 0);
 
-    lv_obj_t *tag = make_label(screen, "PC COMMAND CONSOLE",
-                               &lv_font_montserrat_14, COL_MUTED, 0, 172);
-    lv_obj_set_width(tag, SCREEN_W);
-    lv_obj_set_style_text_align(tag, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_letter_space(tag, 2, 0);
-
     lv_obj_t *rule = lv_obj_create(screen);
     lv_obj_remove_flag(rule, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_pos(rule, 108, 198);
+    lv_obj_set_pos(rule, 108, 162);
     lv_obj_set_size(rule, 24, 2);
     lv_obj_set_style_radius(rule, 1, 0);
     lv_obj_set_style_border_width(rule, 0, 0);
@@ -538,10 +525,11 @@ static lv_obj_t *make_splash(void) {
     lv_obj_set_style_bg_opa(rule, LV_OPA_COVER, 0);
     lv_obj_set_style_pad_all(rule, 0, 0);
 
-    lv_obj_t *by = make_label(screen, "by 24", &lv_font_montserrat_14,
-                              COL_ACCENT, 0, 210);
-    lv_obj_set_width(by, SCREEN_W);
-    lv_obj_set_style_text_align(by, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_t *tag = make_label(screen, "PC COMMAND CONSOLE",
+                               &lv_font_montserrat_14, COL_MUTED, 0, 178);
+    lv_obj_set_width(tag, SCREEN_W);
+    lv_obj_set_style_text_align(tag, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_letter_space(tag, 2, 0);
 
     lv_obj_t *foot = make_label(screen, "ESP32-C3 · USB / Wi-Fi / BLE",
                                 &lv_font_montserrat_14, COL_MUTED, 0, 286);
