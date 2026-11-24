@@ -1,5 +1,6 @@
 // kfb24 —— a PC command console for the FoloToy AI Passport board.
-// Three buttons drive five actions on the PC through the kfb24 bridge.
+// Three buttons drive eight actions over USB, Wi-Fi, or BLE through the
+// kfb24 PC bridge.
 #include "bsp_button.h"
 #include "bsp_display.h"
 #include "bsp_i2c.h"
@@ -74,6 +75,6 @@ void app_main(void) {
     kfb24_power_start();
     kfb24_ui_start();
 
-    ESP_LOGI(TAG, "就绪: Wi-Fi %s，USB 控制台可用",
+    ESP_LOGI(TAG, "就绪: Wi-Fi %s，USB/BLE 控制台可用",
              kfb24_config_is_wifi(&cfg) ? "已配置" : "未配置");
 }

@@ -24,11 +24,21 @@
 #define SCREEN_W 240
 #define SCREEN_H 320
 
+#define KFB24_ACTION_COUNT 8
+
 static const char *TAG = "kfb24_ui";
-static const char *CMDS[5] = {"voice", "ime", "wechat", "orca", "terminal"};
-static const char *NAMES[5] = {"语音识别", "微信输入法", "打开微信", "Orca", "终端"};
-static const char *ICONS[5] = {LV_SYMBOL_AUDIO, LV_SYMBOL_KEYBOARD,
-                               LV_SYMBOL_ENVELOPE, "O", ">_"};
+static const char *CMDS[KFB24_ACTION_COUNT] = {
+    "voice", "ime", "wechat", "orca",
+    "terminal", "trae", "chrome", "edge",
+};
+static const char *NAMES[KFB24_ACTION_COUNT] = {
+    "语音输入", "微信输入法", "微信", "Orca",
+    "终端", "Trae", "Chrome", "Edge",
+};
+static const char *ICONS[KFB24_ACTION_COUNT] = {
+    LV_SYMBOL_AUDIO, LV_SYMBOL_KEYBOARD, LV_SYMBOL_ENVELOPE,
+    "O", ">_", "T", "C", "E",
+};
 
 static bool s_started;
 static lv_obj_t *s_splash;
@@ -38,11 +48,11 @@ static lv_obj_t *s_transport;
 static lv_obj_t *s_batt_icon;
 static lv_obj_t *s_batt_pct;
 static lv_obj_t *s_hint;
-static lv_obj_t *s_cards[5];
-static lv_obj_t *s_icons[5];
-static lv_obj_t *s_names[5];
+static lv_obj_t *s_cards[KFB24_ACTION_COUNT];
+static lv_obj_t *s_icons[KFB24_ACTION_COUNT];
+static lv_obj_t *s_names[KFB24_ACTION_COUNT];
 static lv_obj_t *s_about;
-static lv_obj_t *s_about_values[5];
+static lv_obj_t *s_about_values[6];
 static int s_selected;
 static uint32_t s_cmd_id;
 static uint32_t s_pending_id;
@@ -63,50 +73,32 @@ static lv_obj_t *make_label(lv_obj_t *parent, const char *text,
 }
 
 static lv_obj_t *make_card(lv_obj_t *parent, int x, int y, int w, int h,
-                           const char *icon, const char *name, int index,
-                           bool hero) {
+                           const char *icon, const char *name, int index) {
     lv_obj_t *card = lv_obj_create(parent);
     lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_set_pos(card, x, y);
     lv_obj_set_size(card, w, h);
-    lv_obj_set_style_radius(card, hero ? 18 : 16, 0);
-    lv_obj_set_style_bg_color(card, lv_color_hex(hero ? COL_ACCENT : COL_SURFACE), 0);
+    lv_obj_set_style_radius(card, 14, 0);
+    lv_obj_set_style_bg_color(card, lv_color_hex(COL_SURFACE), 0);
     lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
     lv_obj_set_style_border_color(card, lv_color_hex(COL_BORDER), 0);
-    lv_obj_set_style_border_width(card, hero ? 0 : 1, 0);
+    lv_obj_set_style_border_width(card, 1, 0);
     lv_obj_set_style_border_side(card, LV_BORDER_SIDE_FULL, 0);
     lv_obj_set_style_outline_width(card, 0, 0);
-    lv_obj_set_style_outline_color(card, lv_color_hex(COL_TEXT), 0);
-    lv_obj_set_style_outline_opa(card, LV_OPA_COVER, 0);
-    lv_obj_set_style_shadow_width(card, hero ? 10 : 0, 0);
-    lv_obj_set_style_shadow_color(card, lv_color_hex(COL_ACCENT), 0);
-    lv_obj_set_style_shadow_opa(card, 60, 0);
+    lv_obj_set_style_shadow_width(card, 0, 0);
     lv_obj_set_style_pad_all(card, 0, 0);
 
-    lv_obj_t *icon_label = make_label(card, icon,
-                                      hero ? &lv_font_montserrat_28
-                                           : &lv_font_montserrat_20,
-                                      hero ? COL_ACCENT_DARK : COL_MUTED,
-                                      hero ? 14 : 10, hero ? 15 : 4);
-    lv_obj_t *name_label = make_label(card, name,
-                                      hero ? &kfb24_font_22 : &kfb24_font_16,
-                                      hero ? COL_ACCENT_DARK : COL_TEXT,
-                                      hero ? 52 : 8, hero ? 6 : 30);
-    lv_obj_set_width(name_label, hero ? 152 : 88);
+    lv_obj_t *icon_label = make_label(card, icon, &kfb24_font_16, COL_MUTED, 9, 3);
+    lv_obj_t *name_label = make_label(card, name, &kfb24_font_14, COL_TEXT, 8, 24);
+    lv_obj_set_width(name_label, 90);
     lv_label_set_long_mode(name_label, LV_LABEL_LONG_CLIP);
-
-    if (hero) {
-        make_label(card, "电脑麦克风 · Win+H", &kfb24_font_14,
-                   COL_ACCENT_DARK, 52, 34);
-    }
 
     s_cards[index] = card;
     s_icons[index] = icon_label;
     s_names[index] = name_label;
     return card;
 }
-
 static void set_hint(const char *text, uint32_t color) {
     if (!s_hint) return;
     lv_label_set_text(s_hint, text);
@@ -119,8 +111,13 @@ static void default_hint(const kfb24_link_status_t *st) {
     const char *text;
     uint32_t color;
     if (st->bridge_online) {
-        text = st->bridge_usb ? "已连接 · USB" : "已连接 · Wi-Fi";
+        text = st->bridge_usb ? "已连接 · USB"
+               : st->bridge_ble ? "已连接 · BLE"
+                                : "已连接 · Wi-Fi";
         color = COL_ACCENT;
+    } else if (st->ble_connected) {
+        text = "BLE 已连接 · 等待电脑端";
+        color = COL_WARNING;
     } else if (st->usb_connected) {
         text = "USB 已连接 · 等待电脑端";
         color = COL_WARNING;
@@ -140,23 +137,17 @@ static void default_hint(const kfb24_link_status_t *st) {
 }
 
 static void refresh_selection(void) {
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < KFB24_ACTION_COUNT; i++) {
         if (!s_cards[i]) continue;
         bool selected = i == s_selected;
-        if (i == 0) {
-            lv_obj_set_style_outline_width(s_cards[i], selected ? 2 : 0, 0);
-            lv_obj_set_style_bg_color(s_cards[i], lv_color_hex(COL_ACCENT), 0);
-        } else {
-            lv_obj_set_style_border_width(s_cards[i], selected ? 2 : 1, 0);
-            lv_obj_set_style_border_color(
-                s_cards[i], lv_color_hex(selected ? COL_ACCENT : COL_BORDER), 0);
-            lv_obj_set_style_bg_color(
-                s_cards[i], lv_color_hex(selected ? COL_SURFACE_HI : COL_SURFACE), 0);
-            lv_obj_set_style_text_color(
-                s_icons[i], lv_color_hex(selected ? COL_ACCENT : COL_MUTED), 0);
-            lv_obj_set_style_text_color(
-                s_names[i], lv_color_hex(COL_TEXT), 0);
-        }
+        lv_obj_set_style_border_width(s_cards[i], selected ? 2 : 1, 0);
+        lv_obj_set_style_border_color(
+            s_cards[i], lv_color_hex(selected ? COL_ACCENT : COL_BORDER), 0);
+        lv_obj_set_style_bg_color(
+            s_cards[i], lv_color_hex(selected ? COL_SURFACE_HI : COL_SURFACE), 0);
+        lv_obj_set_style_text_color(
+            s_icons[i], lv_color_hex(selected ? COL_ACCENT : COL_MUTED), 0);
+        lv_obj_set_style_text_color(s_names[i], lv_color_hex(COL_TEXT), 0);
     }
 }
 
@@ -184,18 +175,26 @@ static void update_about(const kfb24_link_status_t *st, int soc, int mv) {
     snprintf(buf, sizeof(buf), "%s · %s", transport, state);
     lv_label_set_text(s_about_values[0], buf);
 
-    if (!st->wifi_configured) {
-        lv_label_set_text(s_about_values[1], "未配置");
-    } else if (st->ssid[0]) {
-        lv_label_set_text(s_about_values[1], st->ssid);
+    if (st->bridge_ble) {
+        lv_label_set_text(s_about_values[1], "已连接 · 桥接");
+    } else if (st->ble_connected) {
+        lv_label_set_text(s_about_values[1], "已连接");
     } else {
-        lv_label_set_text(s_about_values[1], "--");
+        lv_label_set_text(s_about_values[1], "未连接");
+    }
+
+    if (!st->wifi_configured) {
+        lv_label_set_text(s_about_values[2], "未配置");
+    } else if (st->ssid[0]) {
+        lv_label_set_text(s_about_values[2], st->ssid);
+    } else {
+        lv_label_set_text(s_about_values[2], "--");
     }
 
     if (st->wifi_connected && st->ip[0]) {
-        lv_label_set_text(s_about_values[2], st->ip);
+        lv_label_set_text(s_about_values[3], st->ip);
     } else {
-        lv_label_set_text(s_about_values[2], "--");
+        lv_label_set_text(s_about_values[3], "--");
     }
 
     if (soc >= 0) {
@@ -203,8 +202,8 @@ static void update_about(const kfb24_link_status_t *st, int soc, int mv) {
     } else {
         snprintf(buf, sizeof(buf), "%s", "--");
     }
-    lv_label_set_text(s_about_values[3], buf);
-    lv_label_set_text(s_about_values[4], "kfb24 1.0.0");
+    lv_label_set_text(s_about_values[4], buf);
+    lv_label_set_text(s_about_values[5], "kfb24 1.0.0");
 }
 
 static void update_status(void) {
@@ -216,8 +215,9 @@ static void update_status(void) {
 
     if (s_dot) {
         uint32_t color = st.bridge_online ? COL_ACCENT
-                         : (st.usb_connected || st.wifi_connected) ? COL_WARNING
-                                                                   : COL_MUTED;
+                         : (st.usb_connected || st.wifi_connected ||
+                            st.ble_connected) ? COL_WARNING
+                                             : COL_MUTED;
         lv_obj_set_style_bg_color(s_dot, lv_color_hex(color), 0);
     }
     if (s_transport) {
@@ -225,8 +225,9 @@ static void update_status(void) {
         lv_obj_set_style_text_color(
             s_transport,
             lv_color_hex(st.bridge_online ? COL_ACCENT
-                          : (st.usb_connected || st.wifi_connected) ? COL_WARNING
-                                                                    : COL_MUTED),
+                          : (st.usb_connected || st.wifi_connected ||
+                             st.ble_connected) ? COL_WARNING
+                                               : COL_MUTED),
             0);
     }
     if (s_batt_icon && s_batt_pct) {
@@ -254,7 +255,7 @@ static void update_status(void) {
 }
 
 static void execute_action(int index) {
-    if (!s_home || index < 0 || index >= 5) return;
+    if (!s_home || index < 0 || index >= KFB24_ACTION_COUNT) return;
     kfb24_link_status_t st;
     kfb24_link_get_status(&st);
     if (!st.bridge_online) {
@@ -279,7 +280,7 @@ static void execute_action(int index) {
 
 static void card_clicked(lv_event_t *event) {
     int index = (int)(intptr_t)lv_event_get_user_data(event);
-    if (index < 0 || index >= 5) return;
+    if (index < 0 || index >= KFB24_ACTION_COUNT) return;
     s_selected = index;
     refresh_selection();
     execute_action(index);
@@ -289,7 +290,7 @@ static void about_close(void) {
     if (!s_about) return;
     lv_obj_delete(s_about);
     s_about = NULL;
-    for (int i = 0; i < 5; i++) s_about_values[i] = NULL;
+    for (int i = 0; i < 6; i++) s_about_values[i] = NULL;
 }
 
 static lv_obj_t *about_row(lv_obj_t *parent, const char *name, int y) {
@@ -317,8 +318,8 @@ static void about_open(void) {
 
     lv_obj_t *card = lv_obj_create(overlay);
     lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_pos(card, 18, 44);
-    lv_obj_set_size(card, 204, 232);
+    lv_obj_set_pos(card, 18, 42);
+    lv_obj_set_size(card, 204, 236);
     lv_obj_set_style_radius(card, 22, 0);
     lv_obj_set_style_bg_color(card, lv_color_hex(COL_SURFACE), 0);
     lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
@@ -327,15 +328,16 @@ static void about_open(void) {
     lv_obj_set_style_pad_all(card, 0, 0);
 
     make_label(card, "关于 kfb24", &kfb24_font_22, COL_TEXT, 16, 12);
-    s_about_values[0] = about_row(card, "连接", 52);
-    s_about_values[1] = about_row(card, "网络", 76);
-    s_about_values[2] = about_row(card, "地址", 100);
-    s_about_values[3] = about_row(card, "电量", 124);
-    s_about_values[4] = about_row(card, "固件", 148);
+    s_about_values[0] = about_row(card, "连接", 50);
+    s_about_values[1] = about_row(card, "BLE", 72);
+    s_about_values[2] = about_row(card, "网络", 94);
+    s_about_values[3] = about_row(card, "地址", 116);
+    s_about_values[4] = about_row(card, "电量", 138);
+    s_about_values[5] = about_row(card, "固件", 160);
 
     lv_obj_t *divider = lv_obj_create(card);
     lv_obj_remove_flag(divider, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_pos(divider, 16, 176);
+    lv_obj_set_pos(divider, 16, 184);
     lv_obj_set_size(divider, 172, 1);
     lv_obj_set_style_radius(divider, 0, 0);
     lv_obj_set_style_border_width(divider, 0, 0);
@@ -344,12 +346,12 @@ static void about_open(void) {
     lv_obj_set_style_pad_all(divider, 0, 0);
 
     lv_obj_t *by = make_label(card, "by 24", &lv_font_montserrat_14,
-                              COL_ACCENT, 0, 184);
+                              COL_ACCENT, 0, 190);
     lv_obj_set_width(by, 204);
     lv_obj_set_style_text_align(by, LV_TEXT_ALIGN_CENTER, 0);
 
     lv_obj_t *close = make_label(card, "按 OK 关闭", &kfb24_font_14,
-                                 COL_MUTED, 0, 204);
+                                 COL_MUTED, 0, 210);
     lv_obj_set_width(close, 204);
     lv_obj_set_style_text_align(close, LV_TEXT_ALIGN_CENTER, 0);
 
@@ -417,27 +419,23 @@ static void splash_done(lv_timer_t *timer) {
     lv_obj_set_width(s_batt_pct, 38);
     lv_obj_set_style_text_align(s_batt_pct, LV_TEXT_ALIGN_RIGHT, 0);
 
-    make_label(home, "快捷控制", &kfb24_font_22, COL_TEXT, 16, 40);
-    s_hint = make_label(home, "PC COMMAND CONSOLE", &kfb24_font_14, COL_MUTED, 16, 70);
+    make_label(home, "快捷控制", &kfb24_font_22, COL_TEXT, 16, 36);
+    s_hint = make_label(home, "PC COMMAND CONSOLE", &kfb24_font_14, COL_MUTED, 16, 62);
     lv_obj_set_width(s_hint, 208);
     lv_label_set_long_mode(s_hint, LV_LABEL_LONG_DOT);
 
-    lv_obj_t *hero = make_card(home, 12, 88, 216, 58, ICONS[0], NAMES[0], 0, true);
-    lv_obj_add_event_cb(hero, card_clicked, LV_EVENT_CLICKED, (void *)(intptr_t)0);
-
-    lv_obj_t *ime = make_card(home, 12, 154, 104, 58, ICONS[1], NAMES[1], 1, false);
-    lv_obj_add_event_cb(ime, card_clicked, LV_EVENT_CLICKED, (void *)(intptr_t)1);
-    lv_obj_t *wechat = make_card(home, 124, 154, 104, 58, ICONS[2], NAMES[2], 2, false);
-    lv_obj_add_event_cb(wechat, card_clicked, LV_EVENT_CLICKED, (void *)(intptr_t)2);
-    lv_obj_t *orca = make_card(home, 12, 220, 104, 58, ICONS[3], NAMES[3], 3, false);
-    lv_obj_add_event_cb(orca, card_clicked, LV_EVENT_CLICKED, (void *)(intptr_t)3);
-    lv_obj_t *terminal = make_card(home, 124, 220, 104, 58, ICONS[4], NAMES[4], 4, false);
-    lv_obj_add_event_cb(terminal, card_clicked, LV_EVENT_CLICKED,
-                        (void *)(intptr_t)4);
+    for (int i = 0; i < KFB24_ACTION_COUNT; i++) {
+        int col = i % 2;
+        int row = i / 2;
+        lv_obj_t *card = make_card(home, 12 + col * 110, 84 + row * 52,
+                                   106, 48, ICONS[i], NAMES[i], i);
+        lv_obj_add_event_cb(card, card_clicked, LV_EVENT_CLICKED,
+                            (void *)(intptr_t)i);
+    }
 
     lv_obj_t *rule = lv_obj_create(home);
     lv_obj_remove_flag(rule, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_pos(rule, 24, 284);
+    lv_obj_set_pos(rule, 24, 292);
     lv_obj_set_size(rule, 192, 1);
     lv_obj_set_style_radius(rule, 0, 0);
     lv_obj_set_style_border_width(rule, 0, 0);
@@ -445,10 +443,10 @@ static void splash_done(lv_timer_t *timer) {
     lv_obj_set_style_bg_opa(rule, LV_OPA_COVER, 0);
     lv_obj_set_style_pad_all(rule, 0, 0);
 
-    make_label(home, "UP/DOWN 选择 · OK 执行", &kfb24_font_14, COL_MUTED, 24, 292);
+    make_label(home, "OK 执行 · 长按 关于", &kfb24_font_14, COL_MUTED, 16, 297);
     lv_obj_t *by = make_label(home, "by 24", &lv_font_montserrat_14,
-                              COL_ACCENT, 176, 292);
-    lv_obj_set_width(by, 48);
+                              COL_ACCENT, 184, 297);
+    lv_obj_set_width(by, 40);
     lv_obj_set_style_text_align(by, LV_TEXT_ALIGN_RIGHT, 0);
 
     s_selected = 0;
@@ -509,7 +507,7 @@ static lv_obj_t *make_splash(void) {
     lv_obj_set_width(by, SCREEN_W);
     lv_obj_set_style_text_align(by, LV_TEXT_ALIGN_CENTER, 0);
 
-    lv_obj_t *foot = make_label(screen, "ESP32-C3 · USB / Wi-Fi",
+    lv_obj_t *foot = make_label(screen, "ESP32-C3 · USB / Wi-Fi / BLE",
                                 &lv_font_montserrat_14, COL_MUTED, 0, 286);
     lv_obj_set_width(foot, SCREEN_W);
     lv_obj_set_style_text_align(foot, LV_TEXT_ALIGN_CENTER, 0);
@@ -555,10 +553,10 @@ void kfb24_ui_handle_input(bsp_btn_t btn, bsp_btn_ev_t ev) {
     }
 
     if (btn == BSP_BTN_UP) {
-        s_selected = (s_selected + 4) % 5;
+        s_selected = (s_selected + KFB24_ACTION_COUNT - 1) % KFB24_ACTION_COUNT;
         refresh_selection();
     } else if (btn == BSP_BTN_DOWN) {
-        s_selected = (s_selected + 1) % 5;
+        s_selected = (s_selected + 1) % KFB24_ACTION_COUNT;
         refresh_selection();
     } else if (btn == BSP_BTN_OK) {
         execute_action(s_selected);

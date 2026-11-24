@@ -16,9 +16,11 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import ctypes
 import json
 import os
+import queue
 import shutil
 import socket
 import subprocess
@@ -37,6 +39,12 @@ except ImportError:  # pragma: no cover - reported by main
     serial = None
     list_ports = None
 
+try:
+    from bleak import BleakClient, BleakScanner
+except ImportError:  # pragma: no cover - reported by main when --ble is used
+    BleakClient = None
+    BleakScanner = None
+
 VERSION = "1.0.0"
 PREFIX = "KFB24 "
 DEFAULT_TCP_PORT = 8765
@@ -44,9 +52,46 @@ DEFAULT_CONFIG = Path(os.environ.get("APPDATA", str(Path.home()))) / "kfb24" / "
 ESP_VID = 0x303A
 ESP_PID = 0x1001
 
+# Nordic UART Service, matching main/kfb24_ble.c.
+BLE_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
+BLE_RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
+BLE_TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
+
 
 def log(message: str) -> None:
     print(message, flush=True)
+
+
+_bridge_mutex = None
+
+
+def acquire_single_instance() -> None:
+    """Prevent a second bridge from double-executing board commands."""
+    global _bridge_mutex
+    if os.name != "nt":
+        return
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL,
+                                      wintypes.LPCWSTR]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = kernel32.CreateMutexW(None, False, "Local\\kfb24_bridge")
+    if not handle:
+        raise RuntimeError("cannot create the bridge mutex")
+    if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+        kernel32.CloseHandle(handle)
+        raise RuntimeError("another kfb24 bridge is already running")
+    _bridge_mutex = handle
+
+
+def release_single_instance() -> None:
+    global _bridge_mutex
+    if os.name != "nt" or not _bridge_mutex:
+        return
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle(_bridge_mutex)
+    _bridge_mutex = None
 
 
 def parse_frame(line: str) -> Optional[dict]:
@@ -213,7 +258,9 @@ KEYEVENTF_EXTENDEDKEY = 0x0001
 VK_MODS = {"ctrl": 0x11, "control": 0x11, "alt": 0x12, "shift": 0x10,
            "win": 0x5B, "windows": 0x5B}
 VK_KEYS = {"space": 0x20, "tab": 0x09, "enter": 0x0D, "return": 0x0D,
-           "esc": 0x1B, "escape": 0x1B, "h": 0x48}
+           "esc": 0x1B, "escape": 0x1B,
+           "win": 0x5B, "lwin": 0x5B, "rwin": 0x5C}
+VK_RMENU = 0xA5
 
 
 def _key_event(vk: int, up: bool, extended: bool = False) -> INPUT:
@@ -244,16 +291,6 @@ def _send_inputs(events: list[INPUT]) -> bool:
     return True
 
 
-def send_win_h() -> bool:
-    events = [
-        _key_event(0x5B, False, True),
-        _key_event(0x48, False),
-        _key_event(0x48, True),
-        _key_event(0x5B, True, True),
-    ]
-    return _send_inputs(events)
-
-
 def send_hotkey(spec: str) -> bool:
     parts = [part.strip().lower() for part in spec.split("+") if part.strip()]
     if not parts:
@@ -272,12 +309,148 @@ def send_hotkey(spec: str) -> bool:
         if mod_vk is None:
             log(f"input: unknown hotkey modifier {mod!r}")
             return False
-        events.append(_key_event(mod_vk, False))
-    events.append(_key_event(vk, False))
-    events.append(_key_event(vk, True))
+        events.append(_key_event(mod_vk, False, mod_vk in (0x5B, 0x5C)))
+    events.append(_key_event(vk, False, vk in (0x5B, 0x5C)))
+    events.append(_key_event(vk, True, vk in (0x5B, 0x5C)))
     for mod in reversed(parts[:-1]):
-        events.append(_key_event(VK_MODS[mod], True))
+        mod_vk = VK_MODS[mod]
+        events.append(_key_event(mod_vk, True, mod_vk in (0x5B, 0x5C)))
     return _send_inputs(events)
+
+
+def send_right_alt_hold(duration_ms: int = 1200) -> bool:
+    """Hold Right Alt, the common push-to-talk key for Chinese IMEs."""
+    if not _send_inputs([_key_event(VK_RMENU, False, True)]):
+        return False
+    time.sleep(max(1, duration_ms) / 1000.0)
+    return _send_inputs([_key_event(VK_RMENU, True, True)])
+
+
+# Visible top-level process names, matched against the executable basename.
+WINDOW_PROCESSES = {
+    "wechat": ("weixin.exe", "wechat.exe"),
+    "orca": ("orca.exe",),
+    "terminal": ("windowsterminal.exe", "wt.exe"),
+    "trae": ("trae.exe",),
+    "chrome": ("chrome.exe",),
+    "edge": ("msedge.exe",),
+}
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+SW_RESTORE = 9
+
+
+def _process_image_name(pid: int) -> str:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return ""
+    try:
+        buf = ctypes.create_unicode_buffer(1024)
+        size = wintypes.DWORD(len(buf))
+        if not kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+            return ""
+        return Path(buf.value).name.lower()
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def find_window_for_processes(names: tuple[str, ...]) -> Optional[int]:
+    """Return a visible top-level window owned by one of ``names``."""
+    if not IS_WINDOWS or not names:
+        return None
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.EnumWindows.argtypes = [
+        ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM),
+        wintypes.LPARAM,
+    ]
+    user32.EnumWindows.restype = wintypes.BOOL
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+    user32.GetWindowTextLengthW.restype = ctypes.c_int
+    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetWindowTextW.restype = ctypes.c_int
+    user32.GetWindowThreadProcessId.argtypes = [
+        wintypes.HWND, ctypes.POINTER(wintypes.DWORD),
+    ]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+    user32.GetWindowRect.restype = wintypes.BOOL
+
+    targets = {name.lower() for name in names}
+    found: list[int] = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def callback(hwnd, _lparam):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        if user32.GetWindowTextLengthW(hwnd) <= 0:
+            return True
+        rect = wintypes.RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return True
+        if rect.right <= rect.left or rect.bottom <= rect.top:
+            return True
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if not pid.value:
+            return True
+        if _process_image_name(pid.value) in targets:
+            found.append(int(hwnd))
+            return False
+        return True
+
+    user32.EnumWindows(callback, 0)
+    return found[0] if found else None
+
+
+def focus_window(hwnd: int) -> bool:
+    if not IS_WINDOWS:
+        return False
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.ShowWindow.restype = wintypes.BOOL
+    user32.BringWindowToTop.argtypes = [wintypes.HWND]
+    user32.BringWindowToTop.restype = wintypes.BOOL
+    user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+    user32.SetForegroundWindow.restype = wintypes.BOOL
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    user32.GetWindowThreadProcessId.argtypes = [
+        wintypes.HWND, ctypes.POINTER(wintypes.DWORD),
+    ]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+    user32.AttachThreadInput.restype = wintypes.BOOL
+    kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+
+    user32.ShowWindow(hwnd, SW_RESTORE)
+    user32.BringWindowToTop(hwnd)
+    if user32.SetForegroundWindow(hwnd):
+        return True
+
+    foreground = user32.GetForegroundWindow()
+    if not foreground:
+        return False
+    foreground_tid = user32.GetWindowThreadProcessId(foreground, None)
+    current_tid = kernel32.GetCurrentThreadId()
+    if not foreground_tid or foreground_tid == current_tid:
+        return False
+    attached = user32.AttachThreadInput(current_tid, foreground_tid, True)
+    try:
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+    finally:
+        if attached:
+            user32.AttachThreadInput(current_tid, foreground_tid, False)
+    return bool(user32.GetForegroundWindow() == hwnd)
 
 
 def activate_input_profile(clsid: str, profile: str, langid: int) -> bool:
@@ -341,6 +514,14 @@ DEFAULT_CONFIG_VALUES = {
     "orca": str(Path(os.environ.get("LOCALAPPDATA", "")) /
                 "Programs" / "orca" / "Orca.exe"),
     "terminal": "wt.exe",
+    "trae": str(Path(os.environ.get("LOCALAPPDATA", "")) /
+                "Programs" / "Trae" / "Trae.exe"),
+    "chrome": str(Path(os.environ.get("ProgramFiles", r"C:\Program Files")) /
+                  "Google" / "Chrome" / "Application" / "chrome.exe"),
+    "edge": str(Path(os.environ.get("ProgramFiles(x86)",
+                                    r"C:\Program Files (x86)")) /
+                "Microsoft" / "Edge" / "Application" / "msedge.exe"),
+    "voice_hotkey": "ctrl+win",
     "ime_clsid": "{86598FB9-66A2-463E-B9C2-AEB906D477AD}",
     "ime_profile": "{607FDF85-FCC8-4DBD-A365-41296F980C9C}",
     "ime_langid": 0x0804,
@@ -367,9 +548,21 @@ class Actions:
 
     def launch(self, name: str) -> bool:
         path = str(self.config.get(name, ""))
+        processes = WINDOW_PROCESSES.get(name, ())
         if self.dry_run:
-            log(f"dry-run: launch {name}: {path or '<missing>'}")
+            if processes:
+                log(f"dry-run: focus existing {name} window, else launch: "
+                    f"{path or '<missing>'}")
+            else:
+                log(f"dry-run: launch {name}: {path or '<missing>'}")
             return True
+        if processes:
+            hwnd = find_window_for_processes(processes)
+            if hwnd:
+                ok = focus_window(hwnd)
+                log(f"launch: {name}: focused existing window"
+                    if ok else f"launch: {name}: existing window could not be focused")
+                return ok
         if not path:
             log(f"launch: no path configured for {name}")
             return False
@@ -420,17 +613,23 @@ class Actions:
         return False
 
     def voice(self) -> bool:
+        hotkey = str(self.config.get("voice_hotkey", "ctrl+win")).strip()
         if self.dry_run:
-            log("dry-run: send Win+H")
+            log(f"dry-run: send WeType voice hotkey {hotkey or '<disabled>'}")
             return True
-        return send_win_h()
+        if not hotkey:
+            log("voice: voice_hotkey is disabled")
+            return False
+        if hotkey.lower() in ("right-alt", "right_alt", "ralt"):
+            return send_right_alt_hold()
+        return send_hotkey(hotkey)
 
     def run(self, name: str) -> bool:
         if name == "voice":
             return self.voice()
         if name == "ime":
             return self.ime()
-        if name in ("wechat", "orca", "terminal"):
+        if name in ("wechat", "orca", "terminal", "trae", "chrome", "edge"):
             return self.launch(name)
         log(f"action: unknown command {name!r}")
         return False
@@ -535,6 +734,124 @@ class TcpTransport:
             pass
 
 
+class BleTransport:
+    """BLE central for the board's Nordic UART Service."""
+
+    def __init__(self, name: str, on_line, verbose: bool = False):
+        if BleakClient is None or BleakScanner is None:
+            raise RuntimeError("bleak is not installed; pip install -r pc/requirements.txt")
+        self.name = name
+        self.on_line = on_line
+        self.verbose = verbose
+        self._running = True
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._client = None
+        self._buffer = ""
+        self._lines: queue.Queue[str] = queue.Queue(maxsize=128)
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._worker = threading.Thread(target=self._dispatch, daemon=True)
+        self._last_error = ""
+
+    def start(self) -> None:
+        self._worker.start()
+        self._thread.start()
+        log(f"ble: scanning for {self.name}")
+
+    def _dispatch(self) -> None:
+        while self._running:
+            try:
+                line = self._lines.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                self.on_line(line, self)
+            except Exception as error:  # keep the transport alive
+                log(f"ble: handler failed: {error}")
+
+    def _run(self) -> None:
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        try:
+            while self._running:
+                try:
+                    self._loop.run_until_complete(self._session())
+                except Exception as error:  # noqa: BLE001 - keep reconnecting
+                    message = str(error)
+                    if message != self._last_error:
+                        log(f"ble: {message}")
+                        self._last_error = message
+                if self._running:
+                    time.sleep(2.0)
+        finally:
+            self._loop.close()
+            self._loop = None
+
+    async def _session(self) -> None:
+        device = await BleakScanner.find_device_by_name(self.name, timeout=8.0)
+        if device is None:
+            raise RuntimeError(f"{self.name} not found")
+        async with BleakClient(device, timeout=15.0) as client:
+            self._client = client
+            self._last_error = ""
+            self._buffer = ""
+            await client.start_notify(BLE_TX_UUID, self._on_notify)
+            log(f"ble: connected {client.address}")
+            try:
+                while self._running and client.is_connected:
+                    await asyncio.sleep(0.5)
+            finally:
+                self._client = None
+                if client.is_connected:
+                    try:
+                        await client.stop_notify(BLE_TX_UUID)
+                    except Exception:
+                        pass
+
+    def _on_notify(self, _sender, data: bytearray) -> None:
+        try:
+            self._buffer += bytes(data).decode("utf-8", errors="replace")
+        except Exception:
+            return
+        while "\n" in self._buffer:
+            raw, self._buffer = self._buffer.split("\n", 1)
+            line = raw.strip()
+            if line:
+                if self.verbose:
+                    log(f"ble <- {line}")
+                try:
+                    self._lines.put_nowait(line)
+                except queue.Full:
+                    if self.verbose:
+                        log("ble: receive queue full, dropping line")
+        if len(self._buffer) > 65536:
+            self._buffer = ""
+
+    def send(self, line: str) -> bool:
+        loop = self._loop
+        client = self._client
+        if loop is None or client is None:
+            return False
+        future = asyncio.run_coroutine_threadsafe(
+            client.write_gatt_char(BLE_RX_UUID,
+                                   (line + "\n").encode("utf-8"),
+                                   response=False),
+            loop,
+        )
+        try:
+            future.result(timeout=3.0)
+            return True
+        except Exception as error:
+            if self.verbose:
+                log(f"ble: write failed: {error}")
+            return False
+
+    def label(self) -> str:
+        return f"BLE({self.name})"
+
+    def close(self) -> None:
+        self._running = False
+
+
 # ---------------------------------------------------------------------------
 # Bridge
 # ---------------------------------------------------------------------------
@@ -542,11 +859,13 @@ class TcpTransport:
 class Bridge:
     def __init__(self, actions: Actions, serial_port: Optional[str],
                  tcp_port: int, listen: str, verbose: bool = False,
-                 enable_tcp: bool = True):
+                 enable_tcp: bool = True, enable_ble: bool = False,
+                 ble_name: str = "kfb24"):
         self.actions = actions
         self.verbose = verbose
         self.serial: Optional[SerialTransport] = None
         self.tcp: Optional[TcpTransport] = None
+        self.ble: Optional[BleTransport] = None
         self.tcp_lock = threading.Lock()
         self.running = True
         self.board_hello = threading.Event()
@@ -560,13 +879,35 @@ class Bridge:
         self._enable_tcp = enable_tcp
         if serial_port:
             if serial is None:
-                raise RuntimeError("pyserial is not installed")
-            self.serial = SerialTransport(serial_port, self.on_line, verbose)
-            self.serial.open()
-            self.serial.start()
-            log(f"serial: {serial_port} @ 115200")
+                if not enable_ble:
+                    raise RuntimeError("pyserial is not installed")
+                log("serial: pyserial is not installed; continuing with BLE/TCP")
+            else:
+                transport = SerialTransport(serial_port, self.on_line, verbose)
+                try:
+                    transport.open()
+                    transport.start()
+                except Exception as error:  # serial monitor or another bridge holds it
+                    fallback = "+".join(name for name, enabled in
+                                        (("BLE", enable_ble), ("TCP", enable_tcp))
+                                        if enabled)
+                    suffix = (f"; continuing with {fallback}" if fallback
+                              else "; no other transport enabled")
+                    log(f"serial: {serial_port} unavailable ({error}){suffix}")
+                    try:
+                        transport.close()
+                    except Exception:
+                        pass
+                else:
+                    self.serial = transport
+                    log(f"serial: {serial_port} @ 115200")
+        if enable_ble:
+            self.ble = BleTransport(ble_name, self.on_line, verbose)
+            self.ble.start()
         if enable_tcp:
             self._start_tcp_server()
+        if not self.serial and not self.ble and not self.server:
+            raise RuntimeError("no transport available (serial/BLE/TCP)")
 
     def _start_tcp_server(self) -> None:
         bridge = self
@@ -595,13 +936,21 @@ class Bridge:
                     transport.close()
 
         class Server(__import__("socketserver").ThreadingTCPServer):
-            allow_reuse_address = True
+            allow_reuse_address = os.name != "nt"
             daemon_threads = True
+
+            def server_bind(self):
+                if os.name == "nt":
+                    self.socket.setsockopt(socket.SOL_SOCKET,
+                                           socket.SO_EXCLUSIVEADDRUSE, 1)
+                super().server_bind()
 
         try:
             self.server = Server((self._listen, self._tcp_port), Handler)
         except OSError as error:
-            raise RuntimeError(f"TCP listen failed on {self._listen}:{self._tcp_port}: {error}")
+            self.server = None
+            log(f"tcp: disabled ({error}); USB/BLE remain available")
+            return
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         log(f"tcp: listening on {self._listen}:{self._tcp_port} "
             f"(LAN {local_ipv4()}:{self._tcp_port})")
@@ -634,6 +983,8 @@ class Bridge:
             tcp = self.tcp
         if tcp:
             self.send_line(tcp, line)
+        if self.ble:
+            self.send_line(self.ble, line)
 
     def on_line(self, line: str, transport) -> None:
         frame = parse_frame(line)
@@ -708,6 +1059,8 @@ class Bridge:
             tcp.close()
         if self.serial:
             self.serial.close()
+        if self.ble:
+            self.ble.close()
         log("bridge: stopped")
 
 
@@ -721,14 +1074,25 @@ def list_serial_ports() -> None:
 
 
 def run_configure(args, config: dict) -> int:
+    if serial is None:
+        log("configure: pyserial is required for USB provisioning")
+        return 2
     port = find_serial_port(args.port)
     if not port:
         log("configure: no ESP32 USB serial port found; use --port COMx")
         return 2
     actions = Actions(config, dry_run=True)
-    bridge = Bridge(actions, port, args.tcp_port, args.listen, args.verbose,
-                    enable_tcp=False)
     try:
+        bridge = Bridge(actions, port, args.tcp_port, args.listen, args.verbose,
+                        enable_tcp=False)
+    except Exception as error:
+        log(f"configure: {error}; stop the running bridge if it holds the USB port")
+        return 2
+    try:
+        if not bridge.serial:
+            log("configure: USB serial is unavailable; stop the running bridge "
+                "if it holds the port")
+            return 2
         log("configure: waiting for the board to boot...")
         bridge.board_hello.wait(12.0)
         host = args.host or local_ipv4()
@@ -739,20 +1103,28 @@ def run_configure(args, config: dict) -> int:
 
 
 def run_bridge(args, config: dict) -> int:
+    try:
+        acquire_single_instance()
+    except RuntimeError as error:
+        log(f"bridge: {error}")
+        return 0
     port = find_serial_port(args.port)
     if not port and args.port:
         log(f"serial: {args.port} not found")
+        release_single_instance()
         return 2
     if not port:
-        log("serial: board not found; continuing with Wi-Fi/TCP only")
+        log("serial: board not found; continuing with BLE/TCP")
     actions = Actions(config, dry_run=args.dry_run)
     try:
-        bridge = Bridge(actions, port, args.tcp_port, args.listen, args.verbose)
+        bridge = Bridge(actions, port, args.tcp_port, args.listen, args.verbose,
+                        enable_ble=args.ble, ble_name=args.ble_name)
     except Exception as error:
         log(f"bridge: {error}")
+        release_single_instance()
         return 2
     bridge.start_heartbeat()
-    log("bridge: ready for voice/ime/wechat/orca/terminal")
+    log("bridge: ready for voice/ime/wechat/orca/terminal/trae/chrome/edge")
     try:
         while True:
             time.sleep(1.0)
@@ -760,6 +1132,7 @@ def run_bridge(args, config: dict) -> int:
         log("bridge: interrupted")
     finally:
         bridge.stop()
+        release_single_instance()
     return 0
 
 
@@ -773,6 +1146,10 @@ def main() -> int:
                         help="TCP listen address (default 0.0.0.0)")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG,
                         help=f"JSON config (default {DEFAULT_CONFIG})")
+    parser.add_argument("--ble", action="store_true",
+                        help="also connect to the board over BLE (requires bleak)")
+    parser.add_argument("--ble-name", default="kfb24",
+                        help="BLE advertising name (default kfb24)")
     parser.add_argument("--verbose", action="store_true",
                         help="print board logs and every protocol frame")
     parser.add_argument("--dry-run", action="store_true",
@@ -784,16 +1161,20 @@ def main() -> int:
     parser.add_argument("--ssid", help="Wi-Fi SSID for --configure")
     parser.add_argument("--password", help="Wi-Fi password for --configure")
     parser.add_argument("--host", help="PC IPv4 address advertised to the board")
-    parser.add_argument("--test-action", choices=["voice", "ime", "wechat", "orca",
-                                                   "terminal"],
+    parser.add_argument("--test-action",
+                        choices=["voice", "ime", "wechat", "orca", "terminal",
+                                 "trae", "chrome", "edge"],
                         help="run one action locally and exit")
     args = parser.parse_args()
 
     if args.list_ports:
         list_serial_ports()
         return 0
-    if serial is None and not args.test_action:
+    if serial is None and not args.test_action and not args.ble:
         log("pyserial is missing: python -m pip install -r pc/requirements.txt")
+        return 2
+    if args.ble and BleakClient is None:
+        log("bleak is missing: python -m pip install -r pc/requirements.txt")
         return 2
 
     config = load_config(args.config)

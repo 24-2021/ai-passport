@@ -10,9 +10,11 @@ typedef struct {
     bool wifi_configured;
     bool wifi_connected;
     bool tcp_connected;
+    bool ble_connected;
     bool bridge_online;
     bool bridge_usb;
-    char transport[8];             // USB / WiFi / -
+    bool bridge_ble;
+    char transport[8];             // USB / BLE / WiFi / -
     char ip[16];
     char ssid[KFB24_SSID_MAX + 1];
     uint32_t ack_seq;

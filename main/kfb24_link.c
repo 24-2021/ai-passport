@@ -1,5 +1,6 @@
 #include "kfb24_link.h"
 
+#include "kfb24_ble.h"
 #include "kfb24_config.h"
 #include "kfb24_proto.h"
 
@@ -69,9 +70,13 @@ static int s_fd = -1;
 static uint32_t s_tcp_retry_ms;
 static bool s_tcp_fail_logged;
 
-static uint32_t s_last_hello_ms;
+static uint32_t s_hello_usb_ms;
+static uint32_t s_hello_tcp_ms;
+static uint32_t s_hello_ble_ms;
 static bool s_bridge_usb;
+static bool s_bridge_ble;
 static bool s_bridge_online;
+static bool s_ble_was_connected;
 
 static char s_usb_line[USB_LINE_MAX];
 static size_t s_usb_line_len;
@@ -80,6 +85,29 @@ static size_t s_tcp_line_len;
 
 static uint32_t now_ms(void) {
     return (uint32_t)(esp_timer_get_time() / 1000);
+}
+
+// Choose the freshest bridge heartbeat, preferring USB, then BLE, then TCP.
+// This keeps a silent or half-open channel from holding the bridge forever.
+static void update_bridge_route(uint32_t now) {
+    bool usb_fresh = s_usb_connected && s_hello_usb_ms != 0 &&
+                     (now - s_hello_usb_ms) < BRIDGE_TIMEOUT_MS;
+    bool ble_fresh = kfb24_ble_connected() && s_hello_ble_ms != 0 &&
+                     (now - s_hello_ble_ms) < BRIDGE_TIMEOUT_MS;
+    bool tcp_fresh = s_fd >= 0 && s_hello_tcp_ms != 0 &&
+                     (now - s_hello_tcp_ms) < BRIDGE_TIMEOUT_MS;
+
+    if (usb_fresh) {
+        s_bridge_usb = true;
+        s_bridge_ble = false;
+    } else if (ble_fresh) {
+        s_bridge_usb = false;
+        s_bridge_ble = true;
+    } else {
+        s_bridge_usb = false;
+        s_bridge_ble = false;
+    }
+    s_bridge_online = usb_fresh || ble_fresh || tcp_fresh;
 }
 
 static void status_ack(uint32_t id, bool ok) {
@@ -110,6 +138,8 @@ static void tcp_close(void) {
     if (s_fd >= 0) {
         close(s_fd);
         s_fd = -1;
+        s_hello_tcp_ms = 0;
+        update_bridge_route(now_ms());
         ESP_LOGI(TAG, "TCP 已断开");
     }
 }
@@ -137,11 +167,14 @@ static bool tcp_write(const char *line, size_t len) {
 
 static bool send_line_to_pc(const char *line, size_t len) {
     bool sent = false;
-    if (s_usb_connected && (s_bridge_usb || s_fd < 0)) {
+    if (s_usb_connected && (s_bridge_usb || (s_fd < 0 && !s_bridge_ble))) {
         sent = usb_write(line, len);
     }
-    if (!sent && s_fd >= 0) {
+    if (!sent && s_fd >= 0 && !s_bridge_ble) {
         sent = tcp_write(line, len);
+    }
+    if (!sent && s_bridge_ble && kfb24_ble_connected()) {
+        sent = kfb24_ble_send(line, len);
     }
     if (!sent && s_usb_connected) {
         sent = usb_write(line, len);
@@ -161,22 +194,26 @@ static void send_hello(void) {
     if (!len) return;
     if (s_usb_connected) usb_write(line, len);
     if (s_fd >= 0) tcp_write(line, len);
+    if (kfb24_ble_connected()) kfb24_ble_send(line, len);
 }
 
 static void send_state(bool force) {
     static bool last_usb_up = false;
     static bool last_wifi_up = false;
+    static bool last_ble_up = false;
     static uint32_t last_sent_ms = 0;
     uint32_t now = now_ms();
 
     bool usb_up = s_usb_connected;
     bool wifi_up = s_fd >= 0;
+    bool ble_up = kfb24_ble_connected();
     if (!force && usb_up == last_usb_up && wifi_up == last_wifi_up &&
-        now - last_sent_ms < 5000) {
+        ble_up == last_ble_up && now - last_sent_ms < 5000) {
         return;
     }
     last_usb_up = usb_up;
     last_wifi_up = wifi_up;
+    last_ble_up = ble_up;
     last_sent_ms = now;
 
     char line[96];
@@ -189,6 +226,11 @@ static void send_state(bool force) {
         size_t len = kfb24_proto_fmt_state(line, sizeof(line), "wifi", true,
                                            s_ip[0] ? s_ip : "tcp");
         if (len) tcp_write(line, len);
+    }
+    if (ble_up) {
+        size_t len = kfb24_proto_fmt_state(line, sizeof(line), "ble", true,
+                                           s_bridge_ble ? "bridge" : "central");
+        if (len) kfb24_ble_send(line, len);
     }
 }
 
@@ -326,16 +368,15 @@ static void tcp_try_connect(void) {
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
     s_fd = fd;
     s_tcp_fail_logged = false;
-    s_bridge_usb = false;
-    s_last_hello_ms = 0;
-    s_bridge_online = false;
+    s_hello_tcp_ms = 0;
+    update_bridge_route(now_ms());
     ESP_LOGI(TAG, "TCP 已连接 %s:%u", s_cfg.host, (unsigned)s_cfg.port);
     send_hello();
     send_state(true);
 }
 
 static void feed_line(char *buf, size_t *len, const char *data, size_t count,
-                      bool via_usb);
+                      bool via_usb, bool via_ble);
 
 static void handle_cfg(const kfb24_msg_t *msg) {
     kfb24_cfg_t cfg = {0};
@@ -353,24 +394,31 @@ static void handle_cfg(const kfb24_msg_t *msg) {
     send_ack(msg->id, err == ESP_OK);
 }
 
-static void handle_line(const char *line, bool via_usb) {
+static void handle_line(const char *line, bool via_usb, bool via_ble) {
     kfb24_msg_t msg;
     if (!kfb24_proto_parse(line, &msg)) return;
 
     switch (msg.type) {
-    case KFB24_MSG_HELLO:
-        s_last_hello_ms = now_ms();
-        s_bridge_usb = via_usb;
-        s_bridge_online = true;
+    case KFB24_MSG_HELLO: {
+        uint32_t now = now_ms();
+        if (via_usb) {
+            s_hello_usb_ms = now;
+        } else if (via_ble) {
+            s_hello_ble_ms = now;
+        } else {
+            s_hello_tcp_ms = now;
+        }
+        update_bridge_route(now);
         if (!via_usb) s_tcp_fail_logged = false;
         send_state(true);
         break;
+    }
     case KFB24_MSG_ACK:
         status_ack(msg.id, msg.ok);
         break;
     case KFB24_MSG_CFG:
         if (!via_usb) {
-            ESP_LOGW(TAG, "拒绝 LAN 配置请求");
+            ESP_LOGW(TAG, "拒绝非 USB 配置请求");
             send_ack(msg.id, false);
         } else {
             handle_cfg(&msg);
@@ -382,12 +430,12 @@ static void handle_line(const char *line, bool via_usb) {
 }
 
 static void feed_line(char *buf, size_t *len, const char *data, size_t count,
-                      bool via_usb) {
+                      bool via_usb, bool via_ble) {
     for (size_t i = 0; i < count; i++) {
         char c = data[i];
         if (c == '\n') {
             buf[*len] = '\0';
-            if (*len > 0) handle_line(buf, via_usb);
+            if (*len > 0) handle_line(buf, via_usb, via_ble);
             *len = 0;
         } else if (c != '\r') {
             if (*len + 1 < USB_LINE_MAX) {
@@ -405,7 +453,7 @@ static void usb_rx(void) {
     for (;;) {
         int n = usb_serial_jtag_read_bytes(tmp, sizeof(tmp), 0);
         if (n <= 0) break;
-        feed_line(s_usb_line, &s_usb_line_len, tmp, (size_t)n, true);
+        feed_line(s_usb_line, &s_usb_line_len, tmp, (size_t)n, true, false);
     }
 }
 
@@ -415,7 +463,7 @@ static void tcp_rx(void) {
     for (;;) {
         int n = recv(s_fd, tmp, sizeof(tmp), 0);
         if (n > 0) {
-            feed_line(s_tcp_line, &s_tcp_line_len, tmp, (size_t)n, false);
+            feed_line(s_tcp_line, &s_tcp_line_len, tmp, (size_t)n, false, false);
         } else if (n == 0) {
             tcp_close();
             break;
@@ -426,6 +474,13 @@ static void tcp_rx(void) {
             tcp_close();
             break;
         }
+    }
+}
+
+static void ble_rx(void) {
+    char line[KFB24_PROTO_MAX_LINE];
+    while (kfb24_ble_read_line(line, sizeof(line))) {
+        handle_line(line, false, true);
     }
 }
 
@@ -478,9 +533,7 @@ static void publish_status(void) {
     if (!s_status_lock) return;
 
     uint32_t now = now_ms();
-    bool fresh = s_last_hello_ms != 0 && (now - s_last_hello_ms) < BRIDGE_TIMEOUT_MS;
-    bool reachable = s_bridge_usb ? s_usb_connected : (s_fd >= 0);
-    s_bridge_online = fresh && reachable;
+    update_bridge_route(now);
 
     kfb24_link_status_t st;
     memset(&st, 0, sizeof(st));
@@ -490,11 +543,15 @@ static void publish_status(void) {
     st.tcp_connected = s_fd >= 0;
     st.bridge_online = s_bridge_online;
     st.bridge_usb = s_bridge_usb;
+    st.bridge_ble = s_bridge_ble;
+    st.ble_connected = kfb24_ble_connected();
     if (s_bridge_online) {
         snprintf(st.transport, sizeof(st.transport), "%s",
-                 s_bridge_usb ? "USB" : "WiFi");
+                 s_bridge_usb ? "USB" : s_bridge_ble ? "BLE" : "WiFi");
     } else if (s_usb_connected) {
         snprintf(st.transport, sizeof(st.transport), "USB");
+    } else if (st.ble_connected) {
+        snprintf(st.transport, sizeof(st.transport), "BLE");
     } else if (s_wifi_connected) {
         snprintf(st.transport, sizeof(st.transport), "WiFi");
     } else {
@@ -526,18 +583,32 @@ static void link_task(void *arg) {
 
         usb_rx();
         tcp_rx();
+        ble_rx();
         net_events();
+
+        bool ble_now = kfb24_ble_connected();
+        if (ble_now != s_ble_was_connected) {
+            s_ble_was_connected = ble_now;
+            s_hello_ble_ms = 0;
+            update_bridge_route(now);
+            if (ble_now) {
+                send_hello();
+            }
+            send_state(true);
+        }
 
         if (now - s_usb_poll_ms >= USB_POLL_MS) {
             s_usb_poll_ms = now;
             bool connected = s_usb_driver && usb_serial_jtag_is_connected();
             if (connected != s_usb_connected) {
                 s_usb_connected = connected;
+                s_hello_usb_ms = 0;
+                update_bridge_route(now);
                 ESP_LOGI(TAG, "%s", connected ? "USB 主机已连接" : "USB 主机已断开");
                 if (connected) {
                     send_hello();
-                    send_state(true);
                 }
+                send_state(true);
             }
         }
 
@@ -576,7 +647,7 @@ bool kfb24_link_send_cmd(const char *name, uint32_t id) {
     kfb24_link_status_t st;
     kfb24_link_get_status(&st);
     if (!st.bridge_online) return false;
-    if (!st.usb_connected && !st.tcp_connected) return false;
+    if (!st.usb_connected && !st.tcp_connected && !st.ble_connected) return false;
 
     cmd_item_t item = {0};
     snprintf(item.name, sizeof(item.name), "%s", name);
@@ -608,6 +679,12 @@ void kfb24_link_start(const kfb24_cfg_t *cfg) {
     if (usb_serial_jtag_is_driver_installed()) {
         usb_serial_jtag_vfs_use_driver();
         s_usb_driver = true;
+    }
+
+    esp_err_t ble_err = kfb24_ble_start();
+    if (ble_err != ESP_OK) {
+        ESP_LOGW(TAG, "BLE 启动失败，继续使用 USB/Wi-Fi: %s",
+                 esp_err_to_name(ble_err));
     }
 
     if (xTaskCreate(link_task, "kfb24_link", 6144, NULL, 5, NULL) != pdPASS) {

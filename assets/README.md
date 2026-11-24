@@ -43,6 +43,7 @@ Store reusable source images and generated display assets in `images/`.
 | File | Dimensions and format | Use and source |
 | --- | --- | --- |
 | [`images/home.jpg`](images/home.jpg) | 3840 × 2160, JPEG | Product hero image embedded in both project README files to foreground AI Passport and its open, maker-oriented identity. |
+| [`images/kfb24-home.png`](images/kfb24-home.png) | 480 × 640, PNG RGB | Generated 2× preview of the kfb24 home screen for the root README. The layout and colors mirror `main/kfb24_ui.c` (240 × 320, four action rows, footer); it is a preview, not a device photograph. Generated for this repository with Pillow on 2026-11-24 from the documented layout constants. |
 | [`images/readme-hardware-specs.png`](images/readme-hardware-specs.png) | 2172 × 724, PNG RGBA | Optional technical infographic retained as a reference asset; it is no longer used as the homepage hero. Generated for this repository with the built-in image generation tool on 2026-09-17; the six labels and values were checked against the documented hardware contract. |
 | [`images/logo-wordmark.png`](images/logo-wordmark.png) | 1648 × 336, PNG RGBA | Transparent black wordmark extracted from the repository's original `images/logo.png`; embedded in both project README files for light backgrounds. |
 | [`images/logo-wordmark-dark.png`](images/logo-wordmark-dark.png) | 1648 × 336, PNG RGBA | White version of the extracted wordmark, used by the README `<picture>` element when GitHub is in dark mode. |

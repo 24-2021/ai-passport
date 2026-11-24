@@ -6,7 +6,7 @@
 //   KFB24 ACK <id> OK|ERR              both directions
 //   KFB24 CFG <id> <ssid|-> <pass|-> <host|-> <port>
 //                                      PC -> board (hex-encoded strings)
-//   KFB24 STATE <usb|wifi> <0|1> [detail]
+//   KFB24 STATE <usb|wifi|ble> <0|1> [detail]
 //                                      board -> PC
 //
 // Console logs share the USB Serial/JTAG port, so receivers ignore every line

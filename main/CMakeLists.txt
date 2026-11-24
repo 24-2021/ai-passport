@@ -2,6 +2,7 @@ idf_component_register(
     SRCS "main.c"
          "kfb24_proto.c"
          "kfb24_config.c"
+         "kfb24_ble.c"
          "kfb24_link.c"
          "kfb24_power.c"
          "kfb24_ui.c"
@@ -9,5 +10,5 @@ idf_component_register(
          "fonts/kfb24_16.c"
          "fonts/kfb24_22.c"
     INCLUDE_DIRS "."
-    REQUIRES bsp esp_driver_usb_serial_jtag esp_event esp_netif esp_timer esp_wifi lwip nvs_flash
+    REQUIRES bt bsp esp_driver_usb_serial_jtag esp_event esp_netif esp_timer esp_wifi lwip nvs_flash
 )
