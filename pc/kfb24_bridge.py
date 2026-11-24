@@ -626,6 +626,7 @@ class PcmPlayer:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self._lifecycle_lock = threading.Lock()
         self._queue: queue.Queue[bytes] = queue.Queue(maxsize=self.QUEUE_CHUNKS)
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -645,54 +646,56 @@ class PcmPlayer:
                         and self._accepting)
 
     def start(self) -> bool:
-        with self._lock:
-            if self._failed:
-                return False
-            if self._thread and self._thread.is_alive():
-                if self._accepting:
-                    return True
-                self._stop.set()
-            thread = self._thread
+        with self._lifecycle_lock:
+            with self._lock:
+                if self._failed:
+                    return False
+                if self._thread and self._thread.is_alive():
+                    if self._accepting:
+                        return True
+                    self._stop.set()
+                thread = self._thread
             if thread and thread.is_alive():
                 thread.join(1.0)
                 if thread.is_alive():
                     log("audio: previous playback worker did not stop")
                     return False
-            self._stop.clear()
-            while True:
+            with self._lock:
+                self._stop.clear()
+                while True:
+                    try:
+                        self._queue.get_nowait()
+                    except queue.Empty:
+                        break
                 try:
-                    self._queue.get_nowait()
-                except queue.Empty:
-                    break
-            try:
-                import sounddevice as sd
-            except ImportError:
-                log("audio: sounddevice is not installed; WeType will use the "
-                    "PC microphone (python -m pip install -r "
-                    "pc/requirements.txt)")
-                self._failed = True
-                return False
-            try:
-                stream = sd.RawOutputStream(
-                    samplerate=self.SAMPLE_RATE, channels=1, dtype="int16",
-                    blocksize=self.BLOCK_FRAMES,
+                    import sounddevice as sd
+                except ImportError:
+                    log("audio: sounddevice is not installed; WeType will use the "
+                        "PC microphone (python -m pip install -r "
+                        "pc/requirements.txt)")
+                    self._failed = True
+                    return False
+                try:
+                    stream = sd.RawOutputStream(
+                        samplerate=self.SAMPLE_RATE, channels=1, dtype="int16",
+                        blocksize=self.BLOCK_FRAMES,
+                    )
+                    stream.start()
+                except Exception as error:  # PortAudio / device configuration
+                    log(f"audio: cannot open default output ({error}); WeType will "
+                        "use the PC microphone")
+                    self._failed = True
+                    return False
+                self._stream = stream
+                self._accepting = True
+                self._frames = 0
+                self._thread = threading.Thread(
+                    target=self._run, args=(stream,), daemon=True,
+                    name="kfb24-audio",
                 )
-                stream.start()
-            except Exception as error:  # PortAudio / device configuration
-                log(f"audio: cannot open default output ({error}); WeType will "
-                    "use the PC microphone")
-                self._failed = True
-                return False
-            self._stream = stream
-            self._accepting = True
-            self._frames = 0
-            self._thread = threading.Thread(
-                target=self._run, args=(stream,), daemon=True,
-                name="kfb24-audio",
-            )
-            self._thread.start()
-            log(f"audio: playing board PCM at {self.SAMPLE_RATE} Hz")
-            return True
+                self._thread.start()
+                log(f"audio: playing board PCM at {self.SAMPLE_RATE} Hz")
+                return True
 
     def write(self, pcm: bytes) -> None:
         if not pcm:
@@ -744,27 +747,28 @@ class PcmPlayer:
                 pass
 
     def stop(self) -> None:
-        with self._lock:
-            self._accepting = False
-            self._stop.set()
-            thread = self._thread
-        if thread:
-            thread.join(1.0)
-        with self._lock:
-            stream = self._stream
-            self._stream = None
-            self._thread = None
-            while True:
+        with self._lifecycle_lock:
+            with self._lock:
+                self._accepting = False
+                self._stop.set()
+                thread = self._thread
+            if thread:
+                thread.join(1.0)
+            with self._lock:
+                stream = self._stream
+                self._stream = None
+                self._thread = None
+                while True:
+                    try:
+                        self._queue.get_nowait()
+                    except queue.Empty:
+                        break
+            if stream is not None:
                 try:
-                    self._queue.get_nowait()
-                except queue.Empty:
-                    break
-        if stream is not None:
-            try:
-                stream.stop()
-                stream.close()
-            except Exception:
-                pass
+                    stream.stop()
+                    stream.close()
+                except Exception:
+                    pass
 
 
 class Actions:
