@@ -80,7 +80,7 @@ BLE NUS 通道没有应用层认证。范围内任何能连接 `kfb24` 的 BLE c
 
 | 开发板动作 | 电脑端效果 |
 | --- | --- |
-| `voice` | 发送配置的微信输入法语音快捷键（默认 `Ctrl+Win`）。使用微信输入法，不再发送 Windows `Win+H`。 |
+| `voice` | 第一次按下时按住配置的微信输入法语音快捷键（默认 `Ctrl+Win`），再次按下松开。使用微信输入法，不再发送 Windows `Win+H`。 |
 | `ime` | 激活微信输入法 TSF 配置（`{86598FB9-…}` / `{607FDF85-…}`，langid `0x0804`）；失败时发送配置的热键。 |
 | `wechat` | 聚焦已打开的微信窗口；只有不存在窗口时才启动 `Weixin.exe`。 |
 | `orca` | 聚焦已打开的 Orca 窗口；只有不存在窗口时才启动 `Orca.exe`。 |
@@ -89,8 +89,10 @@ BLE NUS 通道没有应用层认证。范围内任何能连接 `kfb24` 的 BLE c
 | `chrome` | 聚焦 Chrome；只有不存在窗口时才启动 `chrome.exe`。 |
 | `edge` | 聚焦 Edge；只有不存在窗口时才启动 `msedge.exe`。 |
 
-`voice` 只负责启动微信输入法语音输入，文字仍进入当前焦点输入框；请先把光标放进
-目标位置。
+`voice` 只负责控制电脑上的语音输入；请先把光标放进目标位置。第一次按下会按住
+快捷键开始录音，第二次按下停止。桥接会在 `voice_max_seconds`（默认 60 秒）后
+自动松开，并在退出时松开，避免开发板或桥接失联后 `Ctrl`/`Win` 卡住。识别出的
+文字仍进入当前焦点输入框。
 
 启动器按可执行文件名匹配可见的顶层窗口，恢复最小化窗口并置于前台。若找到窗口但
 无法聚焦，桥接会报告失败，而不是再启动一个重复进程。
@@ -108,12 +110,17 @@ BLE NUS 通道没有应用层认证。范围内任何能连接 `kfb24` 的 BLE c
   "edge": "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
   "terminal": "wt.exe",
   "voice_hotkey": "ctrl+win",
+  "voice_mode": "latch",
+  "voice_max_seconds": 60,
   "ime_hotkey": "ctrl+space"
 }
 ```
 
-把 `voice_hotkey` 设为 `right-alt` 可改为按住右 Alt，设为空字符串可禁用语音动作。
-请在微信输入法的语音输入设置中配置相同的快捷键。
+`voice_mode` 默认为 `"latch"`：第一次 `voice` 按住快捷键，第二次松开。微信输入法
+使用“启动语音输入”模式时改为 `"tap"`。`voice_max_seconds` 是自动松开秒数，设为
+`0` 可关闭自动松开（不建议）。`voice_hotkey` 设为 `right-alt` 可改为锁存右 Alt，
+设为空字符串可禁用语音动作。请在微信输入法的语音输入设置中选择“按住说话”，并
+配置相同的快捷键。
 
 用 `--config PATH` 指定其他文件；`--dry-run` 只打印动作，不发送输入或启动程序；
 `--test-action voice|ime|wechat|orca|terminal|trae|chrome|edge` 单独测试一个动作；
@@ -128,6 +135,9 @@ BLE NUS 通道没有应用层认证。范围内任何能连接 `kfb24` 的 BLE c
 - BLE 连不上：安装 `bleak`，确认开发板正在广播 `kfb24`，保持在范围内，并确认没有
   其他 central 占用唯一的 BLE 连接。
 - 微信输入法激活失败：确认输入法已安装并启用；桥接会改发 `ime_hotkey` 热键。
-- `voice` 没反应：先聚焦输入框，把微信输入法的语音快捷键设为与 `voice_hotkey`
-  一致，并确认微信输入法正在运行。
+- `voice` 没反应：先聚焦输入框，把微信输入法设为“按住说话”，把语音快捷键设为与
+  `voice_hotkey` 一致，并确认微信输入法正在运行。若使用“启动语音输入”模式，把
+  `"voice_mode"` 设为 `"tap"`。
+- `voice` 后 `Ctrl`/`Win` 卡住：再按一次开发板“语音输入”，或等待
+  `voice_max_seconds` 自动松开；桥接退出时也会松开。
 - 程序被打开两次：先关闭多余的窗口；桥接会聚焦该进程找到的第一个可见顶层窗口。

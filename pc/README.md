@@ -91,7 +91,7 @@ that connects to `kfb24` can send the same commands as the bridge, so enable
 
 | Board action | PC effect |
 | --- | --- |
-| `voice` | Sends the configured WeType voice hotkey (default `Ctrl+Win`). Use WeType voice input, not Windows `Win+H`. |
+| `voice` | First press holds the configured WeType voice hotkey (default `Ctrl+Win`); the next press releases it. Use WeType voice input, not Windows `Win+H`. |
 | `ime` | Activates the WeType TSF profile (`{86598FB9-…}` / `{607FDF85-…}`, langid `0x0804`), falling back to the configured hotkey. |
 | `wechat` | Focuses an existing WeChat window; starts `Weixin.exe` only when no window exists. |
 | `orca` | Focuses an existing Orca window; starts `Orca.exe` only when no window exists. |
@@ -100,8 +100,11 @@ that connects to `kfb24` can send the same commands as the bridge, so enable
 | `chrome` | Focuses Chrome; starts `chrome.exe` only when no window exists. |
 | `edge` | Focuses Edge; starts `msedge.exe` only when no window exists. |
 
-For `voice`, put the cursor in the target edit control first. The hotkey only
-starts WeType voice input; the resulting text goes to the focused window.
+For `voice`, put the cursor in the target edit control first. The first board
+press starts WeType recording by holding the shortcut; the next press stops it.
+The bridge releases the keys after `voice_max_seconds` (default 60) and on exit,
+so a lost board or bridge cannot leave `Ctrl`/`Win` stuck. The resulting text
+goes to the focused window.
 
 The launcher matches visible top-level windows by executable name, restores a
 minimized window, and brings it to the foreground. If a matching window exists
@@ -121,13 +124,19 @@ The bridge reads `%APPDATA%\kfb24\bridge.json` when present. Every key is option
   "edge": "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
   "terminal": "wt.exe",
   "voice_hotkey": "ctrl+win",
+  "voice_mode": "latch",
+  "voice_max_seconds": 60,
   "ime_hotkey": "ctrl+space"
 }
 ```
 
-Set `"voice_hotkey": "right-alt"` to hold Right Alt instead, or an empty string to
-disable the voice action. Configure the same shortcut in WeType's voice-input
-settings.
+`voice_mode` is `"latch"` by default: the first `voice` holds the shortcut, the
+second releases it. Set it to `"tap"` when WeType is configured for its
+"start voice input" (press once to start, press again to stop) mode.
+`voice_max_seconds` is the auto-release timeout; `0` disables it (not
+recommended). Set `voice_hotkey` to `right-alt` to latch Right Alt instead, or
+to an empty string to disable the voice action. Configure the same shortcut and
+WeType's hold-to-talk mode in its voice-input settings.
 
 Use `--config PATH` for a different file, `--dry-run` to log actions without
 sending input or launching apps, and
@@ -144,7 +153,10 @@ locally. `--verbose` prints board console logs and every protocol frame.
   it within range, and make sure no other central holds the single BLE connection.
 - WeType activation fails: confirm the IME is installed and enabled; the bridge
   then sends the `ime_hotkey` fallback.
-- `voice` does nothing: focus a text field, configure the WeType voice shortcut to
-  match `voice_hotkey`, and check that WeType is running.
+- `voice` does nothing: focus a text field, set WeType to hold-to-talk, configure
+  the same shortcut as `voice_hotkey`, and check that WeType is running. If
+  WeType uses start/stop mode instead, set `"voice_mode": "tap"`.
+- `Ctrl`/`Win` stays down after `voice`: press the board `voice` action again, or
+  wait for `voice_max_seconds`; the bridge also releases held keys on exit.
 - An app opens twice: close extra windows once; the bridge focuses the first
   visible top-level window it finds for that process.

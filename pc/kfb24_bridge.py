@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import atexit
 import ctypes
 import json
 import os
@@ -259,8 +260,10 @@ VK_MODS = {"ctrl": 0x11, "control": 0x11, "alt": 0x12, "shift": 0x10,
            "win": 0x5B, "windows": 0x5B}
 VK_KEYS = {"space": 0x20, "tab": 0x09, "enter": 0x0D, "return": 0x0D,
            "esc": 0x1B, "escape": 0x1B,
-           "win": 0x5B, "lwin": 0x5B, "rwin": 0x5C}
+           "win": 0x5B, "lwin": 0x5B, "rwin": 0x5C,
+           "right-alt": 0xA5, "right_alt": 0xA5, "ralt": 0xA5}
 VK_RMENU = 0xA5
+EXTENDED_VKS = {0x5B, 0x5C, VK_RMENU}
 
 
 def _key_event(vk: int, up: bool, extended: bool = False) -> INPUT:
@@ -291,10 +294,13 @@ def _send_inputs(events: list[INPUT]) -> bool:
     return True
 
 
-def send_hotkey(spec: str) -> bool:
+def hotkey_keys(spec: str) -> Optional[list[tuple[int, bool]]]:
+    """Return (virtual-key, extended) pairs, modifiers first."""
     parts = [part.strip().lower() for part in spec.split("+") if part.strip()]
     if not parts:
-        return False
+        return None
+    if len(parts) == 1 and parts[0] in ("right-alt", "right_alt", "ralt"):
+        return [(VK_RMENU, True)]
     key = parts[-1]
     vk = VK_KEYS.get(key)
     if vk is None:
@@ -302,28 +308,45 @@ def send_hotkey(spec: str) -> bool:
             vk = ord(key.upper())
         else:
             log(f"input: unknown hotkey key {key!r}")
-            return False
-    events = []
+            return None
+    keys: list[tuple[int, bool]] = []
     for mod in parts[:-1]:
         mod_vk = VK_MODS.get(mod)
         if mod_vk is None:
             log(f"input: unknown hotkey modifier {mod!r}")
-            return False
-        events.append(_key_event(mod_vk, False, mod_vk in (0x5B, 0x5C)))
-    events.append(_key_event(vk, False, vk in (0x5B, 0x5C)))
-    events.append(_key_event(vk, True, vk in (0x5B, 0x5C)))
-    for mod in reversed(parts[:-1]):
-        mod_vk = VK_MODS[mod]
-        events.append(_key_event(mod_vk, True, mod_vk in (0x5B, 0x5C)))
+            return None
+        keys.append((mod_vk, mod_vk in EXTENDED_VKS))
+    keys.append((vk, vk in EXTENDED_VKS))
+    return keys
+
+
+def press_keys(keys: list[tuple[int, bool]]) -> bool:
+    return _send_inputs([_key_event(vk, False, extended)
+                         for vk, extended in keys])
+
+
+def release_keys(keys: list[tuple[int, bool]]) -> bool:
+    return _send_inputs([_key_event(vk, True, extended)
+                         for vk, extended in reversed(keys)])
+
+
+def send_hotkey(spec: str) -> bool:
+    keys = hotkey_keys(spec)
+    if not keys:
+        return False
+    events = [_key_event(vk, False, extended) for vk, extended in keys]
+    events.extend(_key_event(vk, True, extended)
+                  for vk, extended in reversed(keys))
     return _send_inputs(events)
 
 
 def send_right_alt_hold(duration_ms: int = 1200) -> bool:
     """Hold Right Alt, the common push-to-talk key for Chinese IMEs."""
-    if not _send_inputs([_key_event(VK_RMENU, False, True)]):
+    keys = [(VK_RMENU, True)]
+    if not press_keys(keys):
         return False
     time.sleep(max(1, duration_ms) / 1000.0)
-    return _send_inputs([_key_event(VK_RMENU, True, True)])
+    return release_keys(keys)
 
 
 # Visible top-level process names, matched against the executable basename.
@@ -522,6 +545,8 @@ DEFAULT_CONFIG_VALUES = {
                                     r"C:\Program Files (x86)")) /
                 "Microsoft" / "Edge" / "Application" / "msedge.exe"),
     "voice_hotkey": "ctrl+win",
+    "voice_mode": "latch",
+    "voice_max_seconds": 60,
     "ime_clsid": "{86598FB9-66A2-463E-B9C2-AEB906D477AD}",
     "ime_profile": "{607FDF85-FCC8-4DBD-A365-41296F980C9C}",
     "ime_langid": 0x0804,
@@ -541,10 +566,24 @@ def load_config(path: Path) -> dict:
     return config
 
 
+def voice_max_seconds(config: dict) -> float:
+    try:
+        seconds = float(config.get("voice_max_seconds", 60))
+    except (TypeError, ValueError):
+        seconds = 60.0
+    return max(0.0, min(seconds, 3600.0))
+
+
 class Actions:
     def __init__(self, config: dict, dry_run: bool = False):
         self.config = config
         self.dry_run = dry_run
+        self._voice_lock = threading.Lock()
+        self._voice_keys: list[tuple[int, bool]] = []
+        self._voice_timer: Optional[threading.Timer] = None
+        self._voice_max_seconds = voice_max_seconds(config)
+        if not dry_run:
+            atexit.register(self.close)
 
     def launch(self, name: str) -> bool:
         path = str(self.config.get(name, ""))
@@ -612,7 +651,34 @@ class Actions:
             return send_hotkey(fallback)
         return False
 
+    def _release_voice_locked(self, reason: str) -> bool:
+        timer = self._voice_timer
+        self._voice_timer = None
+        if timer is not None:
+            timer.cancel()
+        keys = self._voice_keys
+        self._voice_keys = []
+        if not keys:
+            return True
+        ok = release_keys(keys)
+        if ok:
+            log(f"voice: {reason}")
+        else:
+            log(f"voice: release failed ({reason})")
+        return ok
+
+    def _voice_timeout(self) -> None:
+        with self._voice_lock:
+            if self._voice_keys:
+                self._release_voice_locked(
+                    f"auto-stopped after {self._voice_max_seconds:g}s")
+
+    def close(self) -> None:
+        with self._voice_lock:
+            self._release_voice_locked("released on exit")
+
     def voice(self) -> bool:
+        """Latch the configured key for hold-to-talk, or tap it in tap mode."""
         hotkey = str(self.config.get("voice_hotkey", "ctrl+win")).strip()
         if self.dry_run:
             log(f"dry-run: send WeType voice hotkey {hotkey or '<disabled>'}")
@@ -620,9 +686,39 @@ class Actions:
         if not hotkey:
             log("voice: voice_hotkey is disabled")
             return False
-        if hotkey.lower() in ("right-alt", "right_alt", "ralt"):
-            return send_right_alt_hold()
-        return send_hotkey(hotkey)
+
+        mode = str(self.config.get("voice_mode", "latch")).strip().lower()
+        if mode in ("tap", "toggle", "once"):
+            if hotkey.lower() in ("right-alt", "right_alt", "ralt"):
+                return send_right_alt_hold()
+            return send_hotkey(hotkey)
+        if mode not in ("latch", "hold", ""):
+            log(f"voice: unknown voice_mode {mode!r}; use latch or tap")
+            return False
+
+        keys = hotkey_keys(hotkey)
+        if not keys:
+            return False
+        with self._voice_lock:
+            if self._voice_keys:
+                return self._release_voice_locked("stopped")
+            if not press_keys(keys):
+                release_keys(keys)
+                log("voice: could not press hotkey")
+                return False
+            self._voice_keys = keys
+            self._voice_max_seconds = voice_max_seconds(self.config)
+            if self._voice_max_seconds > 0:
+                timer = threading.Timer(self._voice_max_seconds,
+                                        self._voice_timeout)
+                timer.daemon = True
+                timer.start()
+                self._voice_timer = timer
+                log("voice: recording; press voice again to stop "
+                    f"(auto-stop in {self._voice_max_seconds:g}s)")
+            else:
+                log("voice: recording; press voice again to stop")
+            return True
 
     def run(self, name: str) -> bool:
         if name == "voice":
@@ -1131,8 +1227,11 @@ def run_bridge(args, config: dict) -> int:
     except KeyboardInterrupt:
         log("bridge: interrupted")
     finally:
-        bridge.stop()
-        release_single_instance()
+        try:
+            bridge.stop()
+        finally:
+            actions.close()
+            release_single_instance()
     return 0
 
 
@@ -1179,7 +1278,11 @@ def main() -> int:
 
     config = load_config(args.config)
     if args.test_action:
-        ok = Actions(config, dry_run=args.dry_run).run(args.test_action)
+        actions = Actions(config, dry_run=args.dry_run)
+        try:
+            ok = actions.run(args.test_action)
+        finally:
+            actions.close()
         return 0 if ok else 1
     if args.configure:
         if not args.ssid:

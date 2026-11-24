@@ -19,8 +19,9 @@ Windows 快捷控制台。三颗实体按键、一块 240×320 屏幕，通过 U
 ## 功能
 
 - **八个动作**：语音输入、微信输入法、微信、Orca、终端、Trae、Chrome、Edge。
-- **微信输入法语音输入**：电脑端发送微信输入法的语音快捷键（默认 `Ctrl+Win`），
-  不再使用 Windows `Win+H`；识别出的文字进入当前焦点输入框。
+- **微信输入法语音输入**：第一次按“语音输入”按住微信输入法的语音快捷键（默认
+  `Ctrl+Win`），再次按下停止；识别出的文字进入当前焦点输入框。默认 60 秒无操作
+  自动松开，桥接退出时也会松开。不再使用 Windows `Win+H`。
 - **聚焦已有窗口**：微信、Orca、终端、Trae、Chrome、Edge 已打开时直接恢复并置于
   前台，不重复启动进程；微信不会出现第二个实例。
 - **三种连接**：USB 串口、Wi-Fi TCP、BLE（Nordic UART Service）。
@@ -66,8 +67,9 @@ Windows 10/11，Python 3.9 或更新版本：
 python -m pip install -r pc/requirements.txt
 ```
 
-安装微信输入法，并在其设置中把语音输入快捷键设为 `Ctrl+Win`（或与
-`voice_hotkey` 相同的组合）。
+安装微信输入法，并在其语音输入设置中选择“按住说话”，把快捷键设为 `Ctrl+Win`
+（或与 `voice_hotkey` 相同的组合）。桥接默认锁存按键：第一次按开发板“语音输入”
+开始说话，第二次按下停止。
 
 ```powershell
 python pc/kfb24_bridge.py --port COM6 --ble
@@ -107,7 +109,7 @@ USB 或 BLE。
 
 | 界面 | 命令 | 电脑端行为 |
 | --- | --- | --- |
-| 语音输入 | `voice` | 发送微信输入法语音快捷键，默认 `Ctrl+Win` |
+| 语音输入 | `voice` | 第一次按住微信输入法语音快捷键，第二次松开；默认 `Ctrl+Win` |
 | 微信输入法 | `ime` | 激活 WeType TSF 配置，失败时发送 `ime_hotkey` |
 | 微信 | `wechat` | 聚焦已有微信窗口，否则启动 `Weixin.exe` |
 | Orca | `orca` | 聚焦已有 Orca，否则启动 `Orca.exe` |
@@ -116,8 +118,9 @@ USB 或 BLE。
 | Chrome | `chrome` | 聚焦已有 Chrome，否则启动 `chrome.exe` |
 | Edge | `edge` | 聚焦已有 Edge，否则启动 `msedge.exe` |
 
-`voice` 只负责启动语音输入；请先把光标放到目标输入框。桥接不会把音频从开发板
-推流到电脑。
+`voice` 只负责控制电脑上的语音输入；请先把光标放到目标输入框。第一次按下开始
+录音，第二次按下停止；桥接不会把音频从开发板推流到电脑。若微信输入法使用“启动
+语音输入”模式，把 `voice_mode` 设为 `"tap"`。
 
 ## 连接与协议
 
@@ -150,14 +153,19 @@ Wi-Fi/TCP。
 ```json
 {
   "voice_hotkey": "ctrl+win",
+  "voice_mode": "latch",
+  "voice_max_seconds": 60,
   "trae": "C:\\Users\\me\\AppData\\Local\\Programs\\Trae\\Trae.exe",
   "chrome": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
   "edge": "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"
 }
 ```
 
-`voice_hotkey` 设为 `right-alt` 时桥接按住右 Alt 1.2 秒；设为空字符串禁用语音动作。
-程序路径和输入法配置的完整说明见 [`pc/README.md`](pc/README.md)。
+`voice_mode` 为 `"latch"`（默认）时，第一次 `voice` 按住快捷键，第二次松开；
+`"tap"` 适合微信输入法的“启动语音输入”模式。`voice_max_seconds` 是自动松开的
+秒数，设为 `0` 可关闭自动松开（不建议）。`voice_hotkey` 设为 `right-alt` 时锁存
+右 Alt；设为空字符串禁用语音动作。程序路径和输入法配置的完整说明见
+[`pc/README.md`](pc/README.md)。
 
 ## 构建与验证
 
