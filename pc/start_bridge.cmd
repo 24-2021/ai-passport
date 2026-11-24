@@ -24,7 +24,7 @@ if not defined PY (
     exit /b 2
 )
 
-%PY% -c "import serial, bleak" >nul 2>nul
+%PY% -c "import serial, bleak, sounddevice" >nul 2>nul
 if errorlevel 1 (
     echo Installing kfb24 bridge dependencies...
     %PY% -m pip install -r "pc\requirements.txt"

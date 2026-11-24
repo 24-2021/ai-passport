@@ -20,10 +20,13 @@ Windows 快捷控制台。三颗实体按键、一块 240×320 屏幕，通过 U
 
 - **八个动作**：语音输入、微信输入法、微信、Orca、终端、Trae、Chrome、Edge。
 - **微信输入法语音输入**：第一次按“语音输入”按住微信输入法的语音快捷键（默认
-  `Ctrl+Win`），再次按下停止；识别出的文字进入当前焦点输入框。默认 60 秒无操作
-  自动松开，桥接退出时也会松开。不再使用 Windows `Win+H`。
-- **聚焦已有窗口**：微信、Orca、终端、Trae、Chrome、Edge 已打开时直接恢复并置于
-  前台，不重复启动进程；微信不会出现第二个实例。
+  `Ctrl+Win`），再次按下停止；识别出的文字进入当前焦点输入框。USB 连接时，开发板
+  把板载麦克风的 16 kHz PCM 送到电脑，桥接播放到默认输出设备，微信输入法从“立体声
+  混音”采集；Wi-Fi/BLE 连接时改回电脑麦克风。默认 60 秒无操作自动松开，桥接退出时
+  也会松开。不再使用 Windows `Win+H`。
+- **聚焦 / 最小化 / 恢复**：微信、Orca、终端、Trae、Chrome、Edge 的动作按当前窗口
+  状态切换：没有窗口就启动，已最小化就恢复并聚焦，已在前台就最小化，其他情况聚焦
+  到前台，不重复启动进程。
 - **三种连接**：USB 串口、Wi-Fi TCP、BLE（Nordic UART Service）。
 - **断线可恢复**：PC 桥接每两秒发送心跳；BLE 断开后自动重连；开发板显示当前
   通道和桥接状态。
@@ -36,7 +39,7 @@ Windows 快捷控制台。三颗实体按键、一块 240×320 屏幕，通过 U
 | MCU | ESP32-C3，8 MB Flash，无 PSRAM |
 | 显示 | ST7789P3，240×320，4-line SPI |
 | 按键 | 三键共用一个 ADC 引脚，分压识别上/下/确定 |
-| 音频 | ES8311 codec，I2S 全双工（kfb24 的语音使用电脑麦克风） |
+| 音频 | ES8311 codec，I2S 全双工；板载麦克风录音（USB 语音），扬声器未用于 kfb24 |
 | 电量 | CW2017 电量计 |
 | 固件 | ESP-IDF 5.5.x |
 
@@ -70,6 +73,17 @@ python -m pip install -r pc/requirements.txt
 安装微信输入法，并在其语音输入设置中选择“按住说话”，把快捷键设为 `Ctrl+Win`
 （或与 `voice_hotkey` 相同的组合）。桥接默认锁存按键：第一次按开发板“语音输入”
 开始说话，第二次按下停止。
+
+板载麦克风语音需要 USB 连接和 Windows“立体声混音”：
+
+1. 右键任务栏音量图标 → 声音设置 → 更多声音设置 → 录制。
+2. 在录制页空白处右键，勾选“显示禁用的设备”。
+3. 右键“立体声混音” → 启用，再右键 → 设为默认设备。
+4. 在微信输入法语音设置中把麦克风选为“立体声混音”；若保留“自动检测”，确认它
+   解析到的是立体声混音。
+
+电脑没有“立体声混音”端点时，桥接仍会锁存语音快捷键，但微信输入法会使用电脑
+麦克风。USB 不是当前桥接通道（BLE/Wi-Fi）时同样使用电脑麦克风。
 
 ```powershell
 python pc/kfb24_bridge.py --port COM6 --ble
@@ -109,18 +123,20 @@ USB 或 BLE。
 
 | 界面 | 命令 | 电脑端行为 |
 | --- | --- | --- |
-| 语音输入 | `voice` | 第一次按住微信输入法语音快捷键，第二次松开；默认 `Ctrl+Win` |
+| 语音输入 | `voice` | USB 时第一次按下开始板载麦克风推流并按住微信输入法语音快捷键，第二次停止；非 USB 时只控制电脑麦克风 |
 | 微信输入法 | `ime` | 激活 WeType TSF 配置，失败时发送 `ime_hotkey` |
-| 微信 | `wechat` | 聚焦已有微信窗口，否则启动 `Weixin.exe` |
-| Orca | `orca` | 聚焦已有 Orca，否则启动 `Orca.exe` |
-| 终端 | `terminal` | 聚焦 Windows Terminal，否则启动 `wt.exe` |
-| Trae | `trae` | 聚焦已有 Trae，否则启动 `Trae.exe` |
-| Chrome | `chrome` | 聚焦已有 Chrome，否则启动 `chrome.exe` |
-| Edge | `edge` | 聚焦已有 Edge，否则启动 `msedge.exe` |
+| 微信 | `wechat` | 启动 / 恢复 / 最小化 / 聚焦微信窗口 |
+| Orca | `orca` | 启动 / 恢复 / 最小化 / 聚焦 Orca |
+| 终端 | `terminal` | 启动 / 恢复 / 最小化 / 聚焦 Windows Terminal |
+| Trae | `trae` | 启动 / 恢复 / 最小化 / 聚焦 Trae |
+| Chrome | `chrome` | 启动 / 恢复 / 最小化 / 聚焦 Chrome |
+| Edge | `edge` | 启动 / 恢复 / 最小化 / 聚焦 Edge |
 
-`voice` 只负责控制电脑上的语音输入；请先把光标放到目标输入框。第一次按下开始
-录音，第二次按下停止；桥接不会把音频从开发板推流到电脑。若微信输入法使用“启动
-语音输入”模式，把 `voice_mode` 设为 `"tap"`。
+`voice` 请先把光标放到目标输入框。USB 桥接时第一次按下会启动板载麦克风推流并
+按住语音快捷键，第二次按下停止推流并松开快捷键；桥接把 PCM 播放到默认输出，
+微信输入法从“立体声混音”取音。若微信输入法使用“启动语音输入”模式，把
+`voice_mode` 设为 `"tap"`。更新电脑端后需安装 `sounddevice`（见
+`pc/requirements.txt`）；没有该模块时桥接只锁存快捷键。
 
 ## 连接与协议
 
@@ -131,7 +147,12 @@ KFB24 CMD <action> <id>
 KFB24 ACK <id> OK|ERR
 KFB24 HELLO bridge/<version>
 KFB24 STATE <transport> <up|down> <detail>
+KFB24 AUDIO <seq> <crc32> <base64-pcm>   ; USB only, 16 kHz mono s16le
+KFB24 AUDIO END                          ; USB only
 ```
+
+音频帧每 512 个采样（1024 字节）发送一次，`crc32` 校验原始 PCM；桥接丢弃损坏帧。
+BLE NUS 与 Wi-Fi TCP 不承载音频。
 
 - **USB**：ESP32-C3 USB-Serial-JTAG，VID:PID `303A:1001`，115200。
 - **Wi-Fi**：开发板作为 TCP 客户端连接电脑的 `8765` 端口；桥接地址和端口在
@@ -191,6 +212,7 @@ idf.py -B build-kfb24 build
 | --- | --- |
 | `main/kfb24_ui.c` | kfb24 界面、八卡片布局、按键交互、关于页 |
 | `main/kfb24_link.c` | USB/Wi-Fi/BLE 链路、心跳、命令与 ACK |
+| `main/kfb24_audio.c` | 板载麦克风采集、base64/CRC32 音频帧、USB 推流 |
 | `main/kfb24_ble.c` | NimBLE NUS 外设 |
 | `main/kfb24_config.c` | NVS 配置 |
 | `main/kfb24_power.c` | 电量与电源状态 |

@@ -50,6 +50,7 @@ typedef struct {
 
 static kfb24_cfg_t s_cfg;
 static SemaphoreHandle_t s_status_lock;
+static SemaphoreHandle_t s_usb_lock;
 static kfb24_link_status_t s_status;
 static QueueHandle_t s_cmd_q;
 
@@ -130,8 +131,23 @@ void kfb24_link_get_status(kfb24_link_status_t *out) {
 
 static bool usb_write(const char *line, size_t len) {
     if (!s_usb_driver || !s_usb_connected) return false;
-    int written = usb_serial_jtag_write_bytes(line, len, pdMS_TO_TICKS(100));
+    bool locked = false;
+    if (s_usb_lock) {
+        locked = xSemaphoreTake(s_usb_lock, pdMS_TO_TICKS(1000)) == pdTRUE;
+        if (!locked) return false;
+    }
+    int written = usb_serial_jtag_write_bytes(line, len, pdMS_TO_TICKS(200));
+    if (locked) xSemaphoreGive(s_usb_lock);
     return written == (int)len;
+}
+
+bool kfb24_link_audio_ready(void) {
+    return s_usb_driver && s_usb_connected && s_bridge_usb;
+}
+
+bool kfb24_link_audio_write(const char *line, size_t len) {
+    if (!line || len == 0 || !kfb24_link_audio_ready()) return false;
+    return usb_write(line, len);
 }
 
 static void tcp_close(void) {
@@ -660,16 +676,17 @@ void kfb24_link_start(const kfb24_cfg_t *cfg) {
     s_cfg = *cfg;
 
     s_status_lock = xSemaphoreCreateMutex();
+    s_usb_lock = xSemaphoreCreateMutex();
     s_cmd_q = xQueueCreate(8, sizeof(cmd_item_t));
     s_net_q = xQueueCreate(8, sizeof(net_evt_t));
-    if (!s_status_lock || !s_cmd_q || !s_net_q) {
+    if (!s_status_lock || !s_usb_lock || !s_cmd_q || !s_net_q) {
         ESP_LOGE(TAG, "链路队列/锁创建失败");
         return;
     }
 
     if (!usb_serial_jtag_is_driver_installed()) {
         usb_serial_jtag_driver_config_t usb_cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
-        usb_cfg.tx_buffer_size = 2048;
+        usb_cfg.tx_buffer_size = 4096;
         usb_cfg.rx_buffer_size = 2048;
         esp_err_t err = usb_serial_jtag_driver_install(&usb_cfg);
         if (err != ESP_OK) {

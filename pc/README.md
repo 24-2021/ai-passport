@@ -12,10 +12,12 @@ on the receiving transport.
 ## Requirements
 
 - Windows 10/11.
-- Python 3.9 or newer with `pyserial`; `bleak` is additionally required for
-  `--ble`:
+- Python 3.9 or newer with `pyserial` and `sounddevice`; `bleak` is additionally
+  required for `--ble`:
   `python -m pip install -r pc/requirements.txt`
 - WeType (the WeChat input method) installed as a TSF input method.
+- For board-microphone voice, Windows "Stereo Mix" enabled and set as the default
+  recording device, and selected in WeType's voice settings.
 - Paths in the defaults below, or a JSON override.
 
 ## Find the board and configure Wi-Fi
@@ -91,24 +93,39 @@ that connects to `kfb24` can send the same commands as the bridge, so enable
 
 | Board action | PC effect |
 | --- | --- |
-| `voice` | First press holds the configured WeType voice hotkey (default `Ctrl+Win`); the next press releases it. Use WeType voice input, not Windows `Win+H`. |
+| `voice` | Over USB, the board streams its microphone; the bridge plays it on the default output while holding the configured WeType hotkey (default `Ctrl+Win`). The next press stops both. On BLE/Wi-Fi only the hotkey is controlled. Use WeType voice input, not Windows `Win+H`. |
 | `ime` | Activates the WeType TSF profile (`{86598FB9-…}` / `{607FDF85-…}`, langid `0x0804`), falling back to the configured hotkey. |
-| `wechat` | Focuses an existing WeChat window; starts `Weixin.exe` only when no window exists. |
-| `orca` | Focuses an existing Orca window; starts `Orca.exe` only when no window exists. |
-| `terminal` | Focuses Windows Terminal; starts `wt.exe` only when no window exists. |
-| `trae` | Focuses Trae; starts `%LOCALAPPDATA%\Programs\Trae\Trae.exe` only when no window exists. |
-| `chrome` | Focuses Chrome; starts `chrome.exe` only when no window exists. |
-| `edge` | Focuses Edge; starts `msedge.exe` only when no window exists. |
+| `wechat` | Opens, restores, minimizes, or focuses a WeChat window, in that state order. |
+| `orca` | Opens, restores, minimizes, or focuses Orca. |
+| `terminal` | Opens, restores, minimizes, or focuses Windows Terminal. |
+| `trae` | Opens, restores, minimizes, or focuses Trae. |
+| `chrome` | Opens, restores, minimizes, or focuses Chrome. |
+| `edge` | Opens, restores, minimizes, or focuses Edge. |
 
-For `voice`, put the cursor in the target edit control first. The first board
-press starts WeType recording by holding the shortcut; the next press stops it.
+For `voice`, put the cursor in the target edit control first. Over USB the board
+captures 16 kHz mono PCM with its ES8311 microphone, sends base64 frames with a
+CRC32 over the USB line protocol, and the bridge plays them through
+`sounddevice` on the default output device. Windows "Stereo Mix" must be enabled
+and set as the default recording device, and WeType must use it as its
+microphone; otherwise WeType records the PC microphone instead.
+
+Enable Stereo Mix in **Sound settings → More sound settings → Recording**:
+right-click the empty area, enable **Show Disabled Devices**, then right-click
+**Stereo Mix** and choose **Enable** and **Set as Default Device**. Select
+**Stereo Mix** in WeType's voice-input settings (or verify that **Auto detect**
+resolves to it).
+
+If `sounddevice` is missing or PortAudio cannot open the default output, the
+bridge logs the reason and still latches the WeType hotkey.
+
 The bridge releases the keys after `voice_max_seconds` (default 60) and on exit,
 so a lost board or bridge cannot leave `Ctrl`/`Win` stuck. The resulting text
 goes to the focused window.
 
-The launcher matches visible top-level windows by executable name, restores a
-minimized window, and brings it to the foreground. If a matching window exists
-but cannot be focused, the bridge reports failure instead of starting a duplicate
+The launcher matches top-level windows by executable name: no window starts the
+app, a minimized window is restored and focused, the foreground window is
+minimized, and any other window is focused. If a matching window exists but
+cannot be focused, the bridge reports failure instead of starting a duplicate
 process.
 
 ## Overrides
@@ -156,6 +173,10 @@ locally. `--verbose` prints board console logs and every protocol frame.
 - `voice` does nothing: focus a text field, set WeType to hold-to-talk, configure
   the same shortcut as `voice_hotkey`, and check that WeType is running. If
   WeType uses start/stop mode instead, set `"voice_mode": "tap"`.
+- `voice` transcribes silence or the PC microphone: the board audio is USB-only;
+  check `usb:` is the active route, enable Stereo Mix, set it as the default
+  recording device, and select it in WeType. Install `sounddevice` and read the
+  `audio:` line in the bridge log for playback errors.
 - `Ctrl`/`Win` stays down after `voice`: press the board `voice` action again, or
   wait for `voice_max_seconds`; the bridge also releases held keys on exit.
 - An app opens twice: close extra windows once; the bridge focuses the first

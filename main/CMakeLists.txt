@@ -4,6 +4,7 @@ idf_component_register(
          "kfb24_config.c"
          "kfb24_ble.c"
          "kfb24_link.c"
+         "kfb24_audio.c"
          "kfb24_power.c"
          "kfb24_ui.c"
          "fonts/kfb24_14.c"

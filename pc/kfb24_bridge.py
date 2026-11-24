@@ -18,6 +18,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import atexit
+import base64
+import binascii
 import ctypes
 import json
 import os
@@ -29,6 +31,7 @@ import sys
 import threading
 import time
 import uuid
+import zlib
 from ctypes import wintypes
 from pathlib import Path
 from typing import Callable, Optional
@@ -360,6 +363,7 @@ WINDOW_PROCESSES = {
 }
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 SW_RESTORE = 9
+SW_MINIMIZE = 6
 
 
 def _process_image_name(pid: int) -> str:
@@ -406,8 +410,12 @@ def find_window_for_processes(names: tuple[str, ...]) -> Optional[int]:
     user32.GetWindowThreadProcessId.restype = wintypes.DWORD
     user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
     user32.GetWindowRect.restype = wintypes.BOOL
+    user32.IsIconic.argtypes = [wintypes.HWND]
+    user32.IsIconic.restype = wintypes.BOOL
+    user32.GetForegroundWindow.restype = wintypes.HWND
 
     targets = {name.lower() for name in names}
+    foreground = int(user32.GetForegroundWindow() or 0)
     found: list[int] = []
 
     @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
@@ -416,22 +424,51 @@ def find_window_for_processes(names: tuple[str, ...]) -> Optional[int]:
             return True
         if user32.GetWindowTextLengthW(hwnd) <= 0:
             return True
+        minimized = bool(user32.IsIconic(hwnd))
         rect = wintypes.RECT()
         if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
             return True
-        if rect.right <= rect.left or rect.bottom <= rect.top:
+        if not minimized and (rect.right <= rect.left or rect.bottom <= rect.top):
             return True
         pid = wintypes.DWORD()
         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
         if not pid.value:
             return True
         if _process_image_name(pid.value) in targets:
+            if int(hwnd) == foreground:
+                found.insert(0, int(hwnd))
+                return False
             found.append(int(hwnd))
-            return False
         return True
 
     user32.EnumWindows(callback, 0)
     return found[0] if found else None
+
+
+def is_minimized(hwnd: int) -> bool:
+    if not IS_WINDOWS:
+        return False
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.IsIconic.argtypes = [wintypes.HWND]
+    user32.IsIconic.restype = wintypes.BOOL
+    return bool(user32.IsIconic(hwnd))
+
+
+def is_foreground(hwnd: int) -> bool:
+    if not IS_WINDOWS:
+        return False
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    return int(user32.GetForegroundWindow() or 0) == hwnd
+
+
+def minimize_window(hwnd: int) -> bool:
+    if not IS_WINDOWS:
+        return False
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.ShowWindow.restype = wintypes.BOOL
+    return bool(user32.ShowWindow(hwnd, SW_MINIMIZE))
 
 
 def focus_window(hwnd: int) -> bool:
@@ -574,10 +611,167 @@ def voice_max_seconds(config: dict) -> float:
     return max(0.0, min(seconds, 3600.0))
 
 
+class PcmPlayer:
+    """Play board PCM on the default Windows output device.
+
+    The board sends 16 kHz / mono / signed-16-bit little-endian chunks.  Writing
+    straight from the serial reader would block USB reads, so a worker thread
+    owns a small bounded queue and drops the oldest chunk when the PC falls
+    behind.  Stereo Mix can then expose this output to WeType as a microphone.
+    """
+
+    SAMPLE_RATE = 16000
+    BLOCK_FRAMES = 512
+    QUEUE_CHUNKS = 24
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._queue: queue.Queue[bytes] = queue.Queue(maxsize=self.QUEUE_CHUNKS)
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._stream = None
+        self._accepting = False
+        self._failed = False
+        self._frames = 0
+
+    def reset_failure(self) -> None:
+        """Allow a later voice session to retry after a device/driver error."""
+        with self._lock:
+            self._failed = False
+
+    def is_active(self) -> bool:
+        with self._lock:
+            return bool(self._thread and self._thread.is_alive()
+                        and self._accepting)
+
+    def start(self) -> bool:
+        with self._lock:
+            if self._failed:
+                return False
+            if self._thread and self._thread.is_alive():
+                if self._accepting:
+                    return True
+                self._stop.set()
+            thread = self._thread
+            if thread and thread.is_alive():
+                thread.join(1.0)
+                if thread.is_alive():
+                    log("audio: previous playback worker did not stop")
+                    return False
+            self._stop.clear()
+            while True:
+                try:
+                    self._queue.get_nowait()
+                except queue.Empty:
+                    break
+            try:
+                import sounddevice as sd
+            except ImportError:
+                log("audio: sounddevice is not installed; WeType will use the "
+                    "PC microphone (python -m pip install -r "
+                    "pc/requirements.txt)")
+                self._failed = True
+                return False
+            try:
+                stream = sd.RawOutputStream(
+                    samplerate=self.SAMPLE_RATE, channels=1, dtype="int16",
+                    blocksize=self.BLOCK_FRAMES,
+                )
+                stream.start()
+            except Exception as error:  # PortAudio / device configuration
+                log(f"audio: cannot open default output ({error}); WeType will "
+                    "use the PC microphone")
+                self._failed = True
+                return False
+            self._stream = stream
+            self._accepting = True
+            self._frames = 0
+            self._thread = threading.Thread(
+                target=self._run, args=(stream,), daemon=True,
+                name="kfb24-audio",
+            )
+            self._thread.start()
+            log(f"audio: playing board PCM at {self.SAMPLE_RATE} Hz")
+            return True
+
+    def write(self, pcm: bytes) -> None:
+        if not pcm:
+            return
+        if not self.is_active():
+            if not self.start():
+                return
+        with self._lock:
+            if not self._accepting:
+                return
+            try:
+                self._queue.put_nowait(pcm)
+            except queue.Full:
+                try:
+                    self._queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    self._queue.put_nowait(pcm)
+                except queue.Full:
+                    pass
+            self._frames += 1
+
+    def _run(self, stream) -> None:
+        try:
+            while True:
+                if self._stop.is_set() and self._queue.empty():
+                    break
+                try:
+                    pcm = self._queue.get(timeout=0.1)
+                except queue.Empty:
+                    if self._stop.is_set():
+                        break
+                    continue
+                try:
+                    stream.write(pcm)
+                except Exception as error:
+                    log(f"audio: playback failed: {error}")
+                    break
+        finally:
+            with self._lock:
+                self._accepting = False
+                if self._stream is stream:
+                    self._stream = None
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:
+                pass
+
+    def stop(self) -> None:
+        with self._lock:
+            self._accepting = False
+            self._stop.set()
+            thread = self._thread
+        if thread:
+            thread.join(1.0)
+        with self._lock:
+            stream = self._stream
+            self._stream = None
+            self._thread = None
+            while True:
+                try:
+                    self._queue.get_nowait()
+                except queue.Empty:
+                    break
+        if stream is not None:
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:
+                pass
+
+
 class Actions:
     def __init__(self, config: dict, dry_run: bool = False):
         self.config = config
         self.dry_run = dry_run
+        self.audio = PcmPlayer()
         self._voice_lock = threading.Lock()
         self._voice_keys: list[tuple[int, bool]] = []
         self._voice_timer: Optional[threading.Timer] = None
@@ -598,6 +792,16 @@ class Actions:
         if processes:
             hwnd = find_window_for_processes(processes)
             if hwnd:
+                if is_minimized(hwnd):
+                    ok = focus_window(hwnd)
+                    log(f"launch: {name}: restored minimized window"
+                        if ok else f"launch: {name}: minimized window could not be restored")
+                    return ok
+                if is_foreground(hwnd):
+                    ok = minimize_window(hwnd)
+                    log(f"launch: {name}: minimized window"
+                        if ok else f"launch: {name}: window could not be minimized")
+                    return ok
                 ok = focus_window(hwnd)
                 log(f"launch: {name}: focused existing window"
                     if ok else f"launch: {name}: existing window could not be focused")
@@ -661,6 +865,7 @@ class Actions:
         if not keys:
             return True
         ok = release_keys(keys)
+        self.audio.stop()
         if ok:
             log(f"voice: {reason}")
         else:
@@ -676,6 +881,7 @@ class Actions:
     def close(self) -> None:
         with self._voice_lock:
             self._release_voice_locked("released on exit")
+        self.audio.stop()
 
     def voice(self) -> bool:
         """Latch the configured key for hold-to-talk, or tap it in tap mode."""
@@ -687,11 +893,17 @@ class Actions:
             log("voice: voice_hotkey is disabled")
             return False
 
+        self.audio.reset_failure()
         mode = str(self.config.get("voice_mode", "latch")).strip().lower()
         if mode in ("tap", "toggle", "once"):
+            self.audio.start()
             if hotkey.lower() in ("right-alt", "right_alt", "ralt"):
-                return send_right_alt_hold()
-            return send_hotkey(hotkey)
+                ok = send_right_alt_hold()
+            else:
+                ok = send_hotkey(hotkey)
+            if not ok:
+                self.audio.stop()
+            return ok
         if mode not in ("latch", "hold", ""):
             log(f"voice: unknown voice_mode {mode!r}; use latch or tap")
             return False
@@ -702,8 +914,10 @@ class Actions:
         with self._voice_lock:
             if self._voice_keys:
                 return self._release_voice_locked("stopped")
+            self.audio.start()
             if not press_keys(keys):
                 release_keys(keys)
+                self.audio.stop()
                 log("voice: could not press hotkey")
                 return False
             self._voice_keys = keys
@@ -765,18 +979,24 @@ class SerialTransport:
         self._thread.start()
 
     def _read_loop(self) -> None:
+        buffer = ""
         while self._running:
             try:
-                raw = self.ser.readline()
+                raw = self.ser.read(4096)
             except (OSError, serial.SerialException) as error:
                 if self._running:
                     log(f"serial: read failed: {error}")
                 break
             if not raw:
                 continue
-            line = raw.decode("utf-8", errors="replace").strip()
-            if line:
-                self.on_line(line, self)
+            buffer += raw.decode("utf-8", errors="replace")
+            while "\n" in buffer:
+                raw_line, buffer = buffer.split("\n", 1)
+                line = raw_line.strip()
+                if line:
+                    self.on_line(line, self)
+            if len(buffer) > 65536:
+                buffer = ""
 
     def send(self, line: str) -> bool:
         if not self.ser.is_open:
@@ -973,6 +1193,7 @@ class Bridge:
         self._tcp_port = tcp_port
         self._listen = listen
         self._enable_tcp = enable_tcp
+        self._audio_drops = 0
         if serial_port:
             if serial is None:
                 if not enable_ble:
@@ -1082,7 +1303,38 @@ class Bridge:
         if self.ble:
             self.send_line(self.ble, line)
 
+    def _on_audio_line(self, line: str, transport) -> None:
+        parts = line.strip().split()
+        if len(parts) == 3 and parts[2] == "END":
+            self.actions.audio.stop()
+            return
+        if len(parts) != 5:
+            self._drop_audio("malformed frame")
+            return
+        try:
+            int(parts[2], 10)
+            crc = int(parts[3], 16)
+            pcm = base64.b64decode(parts[4], validate=True)
+        except (ValueError, binascii.Error):
+            self._drop_audio("bad number/base64")
+            return
+        if len(pcm) != 1024:
+            self._drop_audio(f"unexpected chunk size {len(pcm)}")
+            return
+        if (zlib.crc32(pcm) & 0xFFFFFFFF) != crc:
+            self._drop_audio("CRC mismatch")
+            return
+        self.actions.audio.write(pcm)
+
+    def _drop_audio(self, reason: str) -> None:
+        self._audio_drops += 1
+        if self._audio_drops == 1 or self._audio_drops % 50 == 0:
+            log(f"audio: dropped {self._audio_drops} frame(s): {reason}")
+
     def on_line(self, line: str, transport) -> None:
+        if line.startswith(PREFIX + "AUDIO "):
+            self._on_audio_line(line, transport)
+            return
         frame = parse_frame(line)
         if frame is None:
             if self.verbose:

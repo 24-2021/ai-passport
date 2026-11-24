@@ -2,6 +2,7 @@
 
 #include "bsp_display.h"
 #include "esp_log.h"
+#include "kfb24_audio.h"
 #include "kfb24_fonts.h"
 #include "kfb24_link.h"
 #include "kfb24_power.h"
@@ -60,6 +61,7 @@ static int s_pending_idx;
 static uint32_t s_pending_ms;
 static uint32_t s_seen_ack;
 static uint32_t s_hint_set;
+static bool s_voice_on;
 
 static lv_obj_t *make_label(lv_obj_t *parent, const char *text,
                             const lv_font_t *font, uint32_t color,
@@ -263,6 +265,12 @@ static void execute_action(int index) {
         return;
     }
 
+    bool voice = index == 0;
+    if (!voice && s_voice_on) {
+        kfb24_audio_stop();
+        s_voice_on = false;
+    }
+
     s_cmd_id++;
     if (s_cmd_id == 0) s_cmd_id = 1;
     if (!kfb24_link_send_cmd(CMDS[index], s_cmd_id)) {
@@ -272,6 +280,22 @@ static void execute_action(int index) {
     s_pending_id = s_cmd_id;
     s_pending_idx = index;
     s_pending_ms = lv_tick_get();
+
+    if (voice) {
+        if (s_voice_on) {
+            kfb24_audio_stop();
+            s_voice_on = false;
+            set_hint("录音已停止", COL_ACCENT);
+            return;
+        }
+        if (st.bridge_usb && kfb24_audio_start()) {
+            s_voice_on = true;
+            set_hint("录音中 · 再按停止", COL_ACCENT);
+        } else {
+            set_hint("使用电脑麦克风 · 再按停止", COL_ACCENT);
+        }
+        return;
+    }
 
     char buf[48];
     snprintf(buf, sizeof(buf), "已发送 · %s", NAMES[index]);
@@ -363,12 +387,24 @@ static void status_tick(lv_timer_t *timer) {
     (void)timer;
     kfb24_link_status_t st;
     kfb24_link_get_status(&st);
+    if (s_voice_on && !kfb24_audio_is_active()) {
+        s_voice_on = false;
+        set_hint("录音已停止", COL_WARNING);
+    }
     if (st.ack_seq != s_seen_ack) {
         s_seen_ack = st.ack_seq;
         if (s_pending_id && st.ack_id == s_pending_id) {
             char buf[48];
-            snprintf(buf, sizeof(buf), "%s · %s", st.ack_ok ? "已执行" : "执行失败",
-                     NAMES[s_pending_idx]);
+            if (s_pending_idx == 0 && s_voice_on && !st.ack_ok) {
+                kfb24_audio_stop();
+                s_voice_on = false;
+            }
+            if (s_pending_idx == 0 && s_voice_on) {
+                snprintf(buf, sizeof(buf), "录音中 · 再按停止");
+            } else {
+                snprintf(buf, sizeof(buf), "%s · %s", st.ack_ok ? "已执行" : "执行失败",
+                         NAMES[s_pending_idx]);
+            }
             set_hint(buf, st.ack_ok ? COL_ACCENT : COL_ERROR);
             s_pending_id = 0;
         }
