@@ -23,6 +23,28 @@ static bool copy_token(char *dst, size_t cap, const char *src) {
     return true;
 }
 
+/* Splits on blanks like strtok_r, without depending on POSIX feature macros:
+   the host tests compile this file with plain -std=c11, where glibc hides
+   strtok_r behind _POSIX_C_SOURCE. */
+static char *next_token(char **cursor) {
+    char *p = *cursor;
+    if (!p) return NULL;
+    p += strspn(p, " \t\r\n");
+    if (!*p) {
+        *cursor = NULL;
+        return NULL;
+    }
+    char *start = p;
+    p += strcspn(p, " \t\r\n");
+    if (*p) {
+        *p = '\0';
+        *cursor = p + 1;
+    } else {
+        *cursor = NULL;
+    }
+    return start;
+}
+
 bool kfb24_proto_parse(const char *line, kfb24_msg_t *out) {
     if (!line || !out) return false;
     memset(out, 0, sizeof(*out));
@@ -36,16 +58,16 @@ bool kfb24_proto_parse(const char *line, kfb24_msg_t *out) {
     char work[KFB24_PROTO_MAX_LINE];
     memcpy(work, line, len + 1);
 
-    char *save = NULL;
-    char *tag = strtok_r(work, " \t\r\n", &save);
+    char *save = work;
+    char *tag = next_token(&save);
     if (!tag || strcmp(tag, "KFB24") != 0) return false;
-    char *kind = strtok_r(NULL, " \t\r\n", &save);
+    char *kind = next_token(&save);
     if (!kind) return false;
 
     if (strcmp(kind, "CMD") == 0) {
-        char *name = strtok_r(NULL, " \t\r\n", &save);
-        char *id = strtok_r(NULL, " \t\r\n", &save);
-        if (!name || !id || strtok_r(NULL, " \t\r\n", &save)) return false;
+        char *name = next_token(&save);
+        char *id = next_token(&save);
+        if (!name || !id || next_token(&save)) return false;
         uint32_t value = 0;
         if (!parse_u32(id, UINT32_MAX, &value)) return false;
         if (!copy_token(out->name, sizeof(out->name), name)) return false;
@@ -55,17 +77,17 @@ bool kfb24_proto_parse(const char *line, kfb24_msg_t *out) {
     }
 
     if (strcmp(kind, "HELLO") == 0) {
-        char *version = strtok_r(NULL, " \t\r\n", &save);
-        if (strtok_r(NULL, " \t\r\n", &save)) return false;
+        char *version = next_token(&save);
+        if (next_token(&save)) return false;
         out->type = KFB24_MSG_HELLO;
         if (version && !copy_token(out->text, sizeof(out->text), version)) return false;
         return true;
     }
 
     if (strcmp(kind, "ACK") == 0) {
-        char *id = strtok_r(NULL, " \t\r\n", &save);
-        char *status = strtok_r(NULL, " \t\r\n", &save);
-        if (!id || !status || strtok_r(NULL, " \t\r\n", &save)) return false;
+        char *id = next_token(&save);
+        char *status = next_token(&save);
+        if (!id || !status || next_token(&save)) return false;
         uint32_t value = 0;
         if (!parse_u32(id, UINT32_MAX, &value)) return false;
         if (strcmp(status, "OK") != 0 && strcmp(status, "ERR") != 0) return false;
@@ -76,13 +98,13 @@ bool kfb24_proto_parse(const char *line, kfb24_msg_t *out) {
     }
 
     if (strcmp(kind, "CFG") == 0) {
-        char *id = strtok_r(NULL, " \t\r\n", &save);
-        char *ssid = strtok_r(NULL, " \t\r\n", &save);
-        char *pass = strtok_r(NULL, " \t\r\n", &save);
-        char *host = strtok_r(NULL, " \t\r\n", &save);
-        char *port = strtok_r(NULL, " \t\r\n", &save);
+        char *id = next_token(&save);
+        char *ssid = next_token(&save);
+        char *pass = next_token(&save);
+        char *host = next_token(&save);
+        char *port = next_token(&save);
         if (!id || !ssid || !pass || !host || !port ||
-            strtok_r(NULL, " \t\r\n", &save)) {
+            next_token(&save)) {
             return false;
         }
         uint32_t value = 0;
@@ -117,8 +139,8 @@ bool kfb24_proto_parse(const char *line, kfb24_msg_t *out) {
     }
 
     if (strcmp(kind, "STATE") == 0) {
-        char *transport = strtok_r(NULL, " \t\r\n", &save);
-        char *up = strtok_r(NULL, " \t\r\n", &save);
+        char *transport = next_token(&save);
+        char *up = next_token(&save);
         if (!transport || !up) return false;
         if (!copy_token(out->text, sizeof(out->text), transport)) return false;
         out->type = KFB24_MSG_STATE;
