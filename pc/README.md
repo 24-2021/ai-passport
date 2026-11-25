@@ -4,7 +4,7 @@
 
 # kfb24 PC bridge
 
-`kfb24_bridge.py` turns the board's eight actions into Windows input and app
+`kfb24_bridge.py` turns the board's nine actions into Windows input and app
 launches. It listens on USB serial, Wi-Fi TCP, and optionally BLE, sends
 `KFB24 HELLO` heartbeats every two seconds, and acknowledges every board command
 on the receiving transport.
@@ -95,8 +95,8 @@ python pc/kfb24_bridge.py --ble-only
 
 `--ble-only` implies `--ble` and skips serial autodetection. The board only needs
 power, and Windows Bluetooth must be on. `pc/start_bridge.cmd --ble-only` works
-too. A connected board reports `ble 1 bridge`; all eight actions and their ACKs
-use the NUS link. All eight actions, including voice, work over BLE: the board
+too. A connected board reports `ble 1 bridge`; all nine actions and their ACKs
+use the NUS link. All nine actions, including voice, work over BLE: the board
 streams its own microphone as IMA ADPCM blocks, exactly as it does over USB.
 
 The NUS link has no application-layer authentication. Any BLE central in range
@@ -108,6 +108,7 @@ that connects to `kfb24` can send the same commands as the bridge, so enable
 | Board action | PC effect |
 | --- | --- |
 | `voice` | Streams the board microphone over the active link (USB, BLE, or Wi-Fi) into VB-CABLE's `CABLE Input`, so WeType records `CABLE Output`; holds the configured WeType hotkey (default `Ctrl+Win`). The next press stops both. Use WeType voice input, not Windows `Win+H`. |
+| `enter` | Presses Enter once in the focused window, so the recognised text is submitted (chat send, terminal run, search submit). During a voice session the bridge releases the hotkey and stops the stream first, then presses Enter. |
 | `ime` | Activates the WeType TSF profile (`{86598FB9-…}` / `{607FDF85-…}`, langid `0x0804`), falling back to the configured hotkey. |
 | `wechat` | Opens, restores, minimizes, or focuses a WeChat window, in that state order. |
 | `orca` | Opens, restores, minimizes, or focuses Orca. |
@@ -143,6 +144,11 @@ they cannot redirect a session that is already running.
 
 Recognised text is never copied to the clipboard, and the bridge cannot address
 it to a specific application: WeType alone decides where the characters go.
+Nothing presses Enter automatically: WeType commits a moment after the hotkey
+is released, so an automatic keystroke would race the text, and the same Enter
+would submit a half-finished line. Send the `enter` action when the text looks
+right; the board's up/down keys only move the row selection and stop at the
+first and last row instead of wrapping.
 
 Install VB-CABLE once from https://vb-audio.com/Cable/ (administrator, then
 reboot). In WeType's voice settings select

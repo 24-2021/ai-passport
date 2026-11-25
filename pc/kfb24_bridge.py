@@ -51,7 +51,7 @@ except ImportError:  # pragma: no cover - reported by main when --ble is used
     BleakClient = None
     BleakScanner = None
 
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 PREFIX = "KFB24 "
 DEFAULT_TCP_PORT = 8765
 DEFAULT_CONFIG = Path(os.environ.get("APPDATA", str(Path.home()))) / "kfb24" / "bridge.json"
@@ -1217,6 +1217,25 @@ class Actions:
             return send_hotkey(fallback)
         return False
 
+    def enter(self) -> bool:
+        """Press Enter once, so the recognised text is submitted.
+
+        WeType commits the text into the focused control a moment after the
+        voice hotkey is released, so this is a separate user action rather
+        than an automatic keystroke: pressing it too early would submit an
+        empty line, and only the user knows when the text is complete.
+        """
+        if self.dry_run:
+            log("dry-run: press Enter")
+            return True
+        keys = hotkey_keys("enter")
+        if not keys:
+            return False
+        if not press_keys(keys):
+            return False
+        time.sleep(0.04)  # Give the target a key-down/key-up pair, not a blip.
+        return release_keys(keys)
+
     def _start_audio(self) -> bool:
         if self.audio.start():
             return True
@@ -1350,6 +1369,11 @@ class Actions:
     def run(self, name: str) -> bool:
         if name == "voice":
             return self.voice()
+        if name == "enter":
+            # Submitting while WeType still holds the hotkey would send the
+            # Enter before its text lands, so end the session first.
+            self._end_voice_session("ended by enter")
+            return self.enter()
         if name == "ime":
             # Commit the running WeType session under the current IME first;
             # switching profiles mid-commit can swallow the text.
@@ -1927,7 +1951,7 @@ def run_bridge(args, config: dict) -> int:
         release_single_instance()
         return 2
     bridge.start_heartbeat()
-    log("bridge: ready for voice/ime/wechat/orca/terminal/trae/chrome/edge")
+    log("bridge: ready for voice/enter/ime/wechat/orca/terminal/trae/chrome/edge")
     try:
         while True:
             time.sleep(1.0)
@@ -1972,8 +1996,8 @@ def main() -> int:
     parser.add_argument("--password", help="Wi-Fi password for --configure")
     parser.add_argument("--host", help="PC IPv4 address advertised to the board")
     parser.add_argument("--test-action",
-                        choices=["voice", "ime", "wechat", "orca", "terminal",
-                                 "trae", "chrome", "edge"],
+                        choices=["voice", "enter", "ime", "wechat", "orca",
+                                 "terminal", "trae", "chrome", "edge"],
                         help="run one action locally and exit")
     args = parser.parse_args()
 

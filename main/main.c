@@ -1,5 +1,5 @@
 // kfb24 —— a PC command console for the FoloToy AI Passport board.
-// Three buttons drive eight actions over USB, Wi-Fi, or BLE through the
+// Three buttons drive nine actions over USB, Wi-Fi, or BLE through the
 // kfb24 PC bridge.
 #include "bsp_button.h"
 #include "bsp_display.h"
@@ -41,7 +41,7 @@ static void input_task(void *arg) {
 }
 
 void app_main(void) {
-    ESP_LOGI(TAG, "kfb24 1.0.2 by 24 启动");
+    ESP_LOGI(TAG, "kfb24 1.0.3 by 24 启动");
 
     esp_err_t err = bsp_i2c_init();
     if (err != ESP_OK) ESP_LOGW(TAG, "I2C 初始化失败: %s", esp_err_to_name(err));

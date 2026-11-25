@@ -10,6 +10,20 @@
 > with `CHANGELOG.zh_CN.md`. The entries currently under `Unreleased` are pending
 > review for the next release; they are not a finalized release history.
 
+## Unreleased
+
+- The board gains a ninth action, Send (`enter`): it presses Enter once in the
+  focused window so the recognised text is submitted. It stays manual by
+  design — WeType commits after the voice hotkey is released, so an automatic
+  keystroke would race the text and could submit a half-finished line.
+- Up and Down now clamp at the first and last row instead of wrapping. Pressing
+  Up on the voice row used to jump to the last row, which read as "up does not
+  move up"; Down on the last row likewise stayed put.
+- The nine action rows are 26 px tall and use ASCII icons, because
+  `kfb24_font_16` is generated from the characters under `main/` and does not
+  contain LVGL's private-use symbols — the previous audio/keyboard/envelope
+  icons rendered as blanks.
+
 ## v1.0.2-kfb24 - 2026-11-25
 
 - Voice input from the board now reaches WeType on every transport. The board

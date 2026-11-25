@@ -24,19 +24,21 @@
 #define SCREEN_W 240
 #define SCREEN_H 320
 
-#define KFB24_ACTION_COUNT 8
+#define KFB24_ACTION_COUNT 9
 
 static const char *TAG = "kfb24_ui";
 static const char *CMDS[KFB24_ACTION_COUNT] = {
-    "voice", "ime", "wechat", "orca",
+    "voice", "enter", "ime", "wechat", "orca",
     "terminal", "trae", "chrome", "edge",
 };
 static const char *NAMES[KFB24_ACTION_COUNT] = {
-    "语音输入", "微信输入法", "微信", "Orca",
+    "语音输入", "发送", "微信输入法", "微信", "Orca",
     "终端", "Trae", "Chrome", "Edge",
 };
+// ASCII only: kfb24_font_16 is generated from the characters found under
+// main/, so LVGL's private-use symbols are not in it and render as blanks.
 static const char *ICONS[KFB24_ACTION_COUNT] = {
-    LV_SYMBOL_AUDIO, LV_SYMBOL_KEYBOARD, LV_SYMBOL_ENVELOPE,
+    "V", "S", "I", "W",
     "O", ">_", "T", "C", "E",
 };
 
@@ -80,7 +82,7 @@ static lv_obj_t *make_row(lv_obj_t *parent, int y,
     lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_set_pos(row, 4, y);
-    lv_obj_set_size(row, 232, 30);
+    lv_obj_set_size(row, 232, 26);
     lv_obj_set_style_radius(row, 0, 0);
     lv_obj_set_style_bg_color(row, lv_color_hex(COL_SURFACE_HI), 0);
     lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
@@ -91,18 +93,18 @@ static lv_obj_t *make_row(lv_obj_t *parent, int y,
 
     lv_obj_t *bar = lv_obj_create(row);
     lv_obj_remove_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_pos(bar, 0, 7);
-    lv_obj_set_size(bar, 3, 16);
+    lv_obj_set_pos(bar, 0, 5);
+    lv_obj_set_size(bar, 3, 14);
     lv_obj_set_style_radius(bar, 0, 0);
     lv_obj_set_style_bg_color(bar, lv_color_hex(COL_BORDER), 0);
     lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(bar, 0, 0);
     lv_obj_set_style_pad_all(bar, 0, 0);
 
-    lv_obj_t *icon_label = make_label(row, icon, &kfb24_font_16, COL_MUTED, 12, 6);
+    lv_obj_t *icon_label = make_label(row, icon, &kfb24_font_16, COL_MUTED, 12, 4);
     lv_obj_set_width(icon_label, 20);
     lv_obj_t *name_label = make_label(row, name, &kfb24_font_14,
-                                      COL_TEXT_DIM, 36, 7);
+                                      COL_TEXT_DIM, 36, 5);
     lv_obj_set_width(name_label, 188);
     lv_label_set_long_mode(name_label, LV_LABEL_LONG_CLIP);
 
@@ -216,7 +218,7 @@ static void update_about(const kfb24_link_status_t *st, int soc, int mv) {
         snprintf(buf, sizeof(buf), "%s", "--");
     }
     lv_label_set_text(s_about_values[4], buf);
-    lv_label_set_text(s_about_values[5], "kfb24 1.0.2");
+    lv_label_set_text(s_about_values[5], "kfb24 1.0.3");
 }
 
 static void update_status(void) {
@@ -310,7 +312,11 @@ static void execute_action(int index) {
     }
 
     char buf[48];
-    snprintf(buf, sizeof(buf), "已发送 · %s", NAMES[index]);
+    if (strcmp(CMDS[index], "enter") == 0) {
+        snprintf(buf, sizeof(buf), "已发送 · Enter");
+    } else {
+        snprintf(buf, sizeof(buf), "已发送 · %s", NAMES[index]);
+    }
     set_hint(buf, COL_ACCENT);
 }
 
@@ -353,7 +359,7 @@ static void about_open(void) {
     lv_obj_set_style_bg_opa(overlay, LV_OPA_COVER, 0);
 
     make_label(overlay, "关于", &kfb24_font_22, COL_TEXT, 16, 14);
-    lv_obj_t *version = make_label(overlay, "kfb24 1.0.2",
+    lv_obj_t *version = make_label(overlay, "kfb24 1.0.3",
                                    &lv_font_montserrat_14, COL_MUTED, 16, 46);
     lv_obj_set_width(version, 208);
     lv_obj_set_style_text_align(version, LV_TEXT_ALIGN_RIGHT, 0);
@@ -467,7 +473,7 @@ static void splash_done(lv_timer_t *timer) {
     lv_obj_set_style_pad_all(rule, 0, 0);
 
     for (int i = 0; i < KFB24_ACTION_COUNT; i++) {
-        lv_obj_t *row = make_row(home, 36 + i * 30,
+        lv_obj_t *row = make_row(home, 36 + i * 26,
                                  ICONS[i], NAMES[i], i);
         lv_obj_add_event_cb(row, card_clicked, LV_EVENT_CLICKED,
                             (void *)(intptr_t)i);
@@ -578,11 +584,17 @@ void kfb24_ui_handle_input(bsp_btn_t btn, bsp_btn_ev_t ev) {
     }
 
     if (btn == BSP_BTN_UP) {
-        s_selected = (s_selected + KFB24_ACTION_COUNT - 1) % KFB24_ACTION_COUNT;
-        refresh_selection();
+        // Clamp, do not wrap: from the first row, wrapping to the last one
+        // reads as "up did not move up".
+        if (s_selected > 0) {
+            s_selected--;
+            refresh_selection();
+        }
     } else if (btn == BSP_BTN_DOWN) {
-        s_selected = (s_selected + 1) % KFB24_ACTION_COUNT;
-        refresh_selection();
+        if (s_selected < KFB24_ACTION_COUNT - 1) {
+            s_selected++;
+            refresh_selection();
+        }
     } else if (btn == BSP_BTN_OK) {
         execute_action(s_selected);
     }

@@ -41,7 +41,7 @@ kfb24 应用内置 Noto Sans SC 的 14、16、22 px 子集。生成的字库源�
 | 文件 | 尺寸与格式 | 用途与来源 |
 | --- | --- | --- |
 | [`images/home.jpg`](images/home.jpg) | 3840 × 2160，JPEG | 嵌入中英文项目 README 的产品主图，突出 AI Passport 产品形象与开放、人人可创作的理念。 |
-| [`images/kfb24-home.png`](images/kfb24-home.png) | 480 × 640，PNG RGB | kfb24 主界面的 2 倍生成预览，用于根 README。布局与配色对应 `main/kfb24_ui.c` 的 240 × 320、四行动作卡片和页脚；这是界面预览，不是设备照片。2026-11-24 使用 Pillow 按代码中的布局常量生成。 |
+| [`images/kfb24-home.png`](images/kfb24-home.png) | 480 × 640，PNG RGB | kfb24 主界面的 2 倍生成预览，用于根 README。布局与配色对应 `main/kfb24_ui.c` 的 240 × 320、九行 26 px 动作卡片和页脚；这是界面预览，不是设备照片。2026-11-25 使用 Pillow 按代码中的布局常量生成。 |
 | [`images/readme-hardware-specs.png`](images/readme-hardware-specs.png) | 2172 × 724，PNG RGBA | 保留为可选技术参考图，不再用于首页主视觉。于 2026-09-17 使用内置图像生成工具为本仓库生成；已根据文档中的硬件能力契约核对图中的六项标签与参数。 |
 | [`images/logo-wordmark.png`](images/logo-wordmark.png) | 1648 × 336，PNG RGBA | 从仓库原始 `images/logo.png` 中精确裁切并去除背景的黑色字标；用于中英文项目 README 的浅色主题。 |
 | [`images/logo-wordmark-dark.png`](images/logo-wordmark-dark.png) | 1648 × 336，PNG RGBA | 提取字标的白色版本；README 使用 `<picture>` 在 GitHub 深色主题下显示。 |

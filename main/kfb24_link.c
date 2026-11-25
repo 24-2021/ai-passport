@@ -30,7 +30,7 @@
 #define USB_LINE_MAX KFB24_PROTO_MAX_LINE
 
 static const char *TAG = "kfb24_link";
-static const char *FW_VERSION = "kfb24/1.0.2";
+static const char *FW_VERSION = "kfb24/1.0.3";
 
 typedef struct {
     char name[16];
