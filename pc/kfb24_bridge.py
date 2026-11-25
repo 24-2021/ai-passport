@@ -26,12 +26,14 @@ import os
 import queue
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import threading
 import time
 import uuid
 import zlib
+from array import array
 from ctypes import wintypes
 from pathlib import Path
 from typing import Callable, Optional
@@ -49,7 +51,7 @@ except ImportError:  # pragma: no cover - reported by main when --ble is used
     BleakClient = None
     BleakScanner = None
 
-VERSION = "1.0.0"
+VERSION = "1.0.2"
 PREFIX = "KFB24 "
 DEFAULT_TCP_PORT = 8765
 DEFAULT_CONFIG = Path(os.environ.get("APPDATA", str(Path.home()))) / "kfb24" / "bridge.json"
@@ -60,6 +62,56 @@ ESP_PID = 0x1001
 BLE_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
 BLE_RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
 BLE_TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
+
+# Board audio: 16 kHz mono s16le, IMA ADPCM in independent 640-sample blocks.
+# Keep in sync with main/kfb24_adpcm.h and main/kfb24_adpcm.c.
+ADPCM_SAMPLES = 640
+ADPCM_BYTES = 323
+_ADPCM_STEP = (
+    7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37,
+    41, 45, 50, 55, 60, 66, 73, 80, 88, 97, 107, 118, 130, 143, 157, 173,
+    190, 209, 230, 253, 279, 307, 337, 371, 408, 449, 494, 544, 598, 658,
+    724, 796, 876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066,
+    2272, 2499, 2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358, 5894, 6484,
+    7132, 7845, 8630, 9493, 10442, 11487, 12635, 13899, 15289, 16818, 18500,
+    20350, 22385, 24623, 27086, 29794, 32767,
+)
+_ADPCM_INDEX = (-1, -1, -1, -1, 2, 4, 6, 8,
+                -1, -1, -1, -1, 2, 4, 6, 8)
+
+
+def adpcm_decode(data: bytes) -> Optional[bytes]:
+    """Decode one board block; None when the block is malformed."""
+    if len(data) != ADPCM_BYTES:
+        return None
+    index = data[2]
+    if index > 88:
+        return None
+    predictor = int.from_bytes(data[0:2], "little", signed=True)
+    pcm = array("h", [predictor])
+    nibble = 3
+    for i in range(1, ADPCM_SAMPLES):
+        if i & 1:
+            code = data[nibble] >> 4
+        else:
+            code = data[nibble] & 0x0F
+            nibble += 1
+        step = _ADPCM_STEP[index]
+        delta = step >> 3
+        if code & 4:
+            delta += step
+        if code & 2:
+            delta += step >> 1
+        if code & 1:
+            delta += step >> 2
+        predictor = predictor - delta if code & 8 else predictor + delta
+        if predictor > 32767:
+            predictor = 32767
+        elif predictor < -32768:
+            predictor = -32768
+        index = min(88, max(0, index + _ADPCM_INDEX[code]))
+        pcm.append(predictor)
+    return pcm.tobytes()
 
 
 def log(message: str) -> None:
@@ -584,6 +636,7 @@ DEFAULT_CONFIG_VALUES = {
     "voice_hotkey": "ctrl+win",
     "voice_mode": "latch",
     "voice_max_seconds": 60,
+    "virtual_mic": "CABLE Input",
     "ime_clsid": "{86598FB9-66A2-463E-B9C2-AEB906D477AD}",
     "ime_profile": "{607FDF85-FCC8-4DBD-A365-41296F980C9C}",
     "ime_langid": 0x0804,
@@ -612,12 +665,13 @@ def voice_max_seconds(config: dict) -> float:
 
 
 class AudioGuard:
-    """Temporarily unmute the Windows endpoints used by voice input.
+    """Temporarily unmute the virtual microphone's playback endpoint.
 
-    WeType receives board PCM (or the PC microphone fallback) through Stereo
-    Mix.  Windows can leave the output, Stereo Mix, or the physical microphone
-    muted; PortAudio then opens successfully and produces silence.  Save the
-    original states once per voice session and restore them when it stops.
+    WeType records "CABLE Output", which is the capture side of the "CABLE
+    Input" playback endpoint.  Windows can leave that endpoint or its volume
+    muted; PortAudio then opens successfully and writes silence.  Save the
+    original state once per voice session and restore it when the session
+    stops.
     """
 
     def __init__(self) -> None:
@@ -692,8 +746,15 @@ class AudioGuard:
         except Exception as error:
             log(f"audio: cannot unmute {kind} {name} ({error})")
 
-    def prepare(self, output_name: Optional[str] = None,
-                mic_name: Optional[str] = None) -> None:
+    def prepare(self, output_name: Optional[str] = None) -> None:
+        """Unmute the virtual microphone's playback endpoint.
+
+        WeType records "CABLE Output"; Windows exposes it as the capture side
+        of the "CABLE Input" playback endpoint.  That endpoint or its volume
+        can be muted, in which case PortAudio writes silence successfully.
+        """
+        if not output_name:
+            return
         utilities = self._utilities()
         if utilities is None:
             if not self._warned:
@@ -707,24 +768,10 @@ class AudioGuard:
         except Exception as error:
             log(f"audio: cannot enumerate Windows endpoints ({error})")
             return
-        loopback = ("立体声混音", "stereo mix", "what u hear", "loopback", "混音")
-        if output_name:
-            base = output_name.split(" (")[0].strip().lower()
-            output = self._find(devices, (base,), loopback)
-        else:
-            output = self._find(devices, ("speakers", "扬声器", "headphones", "耳机"), loopback)
+        base = output_name.split(" (")[0].strip().lower()
+        output = self._find(devices, (base,))
         if output is not None:
-            self._unmute(output, "output")
-        stereo = self._find(devices, loopback)
-        if stereo is not None:
-            self._unmute(stereo, "Stereo Mix")
-        if mic_name:
-            base = mic_name.split(" (")[0].strip().lower()
-            mic = self._find(devices, (base,), loopback)
-        else:
-            mic = self._find(devices, ("麦克风阵列", "microphone", "麦克风", "mic"), loopback)
-        if mic is not None and mic is not output:
-            self._unmute(mic, "microphone")
+            self._unmute(output, "virtual microphone")
 
     def restore(self) -> None:
         with self._lock:
@@ -761,20 +808,62 @@ class AudioGuard:
                 pass
 
 
-class PcmPlayer:
-    """Play board PCM on the default Windows output device.
+class _LinearResampler:
+    """Stateful 16 kHz -> endpoint-rate linear interpolation."""
 
-    The board sends 16 kHz / mono / signed-16-bit little-endian chunks.  Writing
-    straight from the serial reader would block USB reads, so a worker thread
-    owns a small bounded queue and drops the oldest chunk when the PC falls
-    behind.  Stereo Mix can then expose this output to WeType as a microphone.
+    def __init__(self, source_rate: int, target_rate: int) -> None:
+        self.step = source_rate / float(target_rate)
+        self.phase = 0.0
+        self.prev = 0
+
+    def process(self, samples) -> array:
+        n = len(samples)
+        out = array("h")
+        if n == 0:
+            return out
+        step = self.step
+        phase = self.phase
+        prev = self.prev
+        last = n - 1
+        while phase < last:
+            if phase < 0:
+                a = prev
+                b = samples[0]
+                frac = phase + 1.0
+            else:
+                i = int(phase)
+                frac = phase - i
+                a = samples[i]
+                b = samples[i + 1] if i < last else samples[last]
+            value = a + (b - a) * frac
+            out.append(int(value + 0.5) if value >= 0 else int(value - 0.5))
+            phase += step
+        self.phase = phase - n
+        self.prev = samples[last]
+        return out
+
+
+class VirtualMic:
+    """Feed board PCM to a playback endpoint that WeType records from.
+
+    VB-CABLE exposes one playback endpoint ("CABLE Input") whose capture side
+    ("CABLE Output") appears to WeType as a microphone.  The board sends
+    16 kHz mono s16le in 40 ms blocks; WASAPI shared mode expects the endpoint
+    mix format (normally 48 kHz stereo), so a stateful resampler converts the
+    rate and duplicates the mono signal.  A worker thread owns the stream so
+    the BLE/serial reader never blocks on audio.
     """
 
-    SAMPLE_RATE = 16000
-    BLOCK_FRAMES = 512
-    QUEUE_CHUNKS = 24
+    SOURCE_RATE = 16000
+    QUEUE_CHUNKS = 25
+    DEFAULT_NAME = "CABLE Input"
+    FALLBACK_NAMES = ("cable input", "vb-audio virtual cable",
+                      "voicemeeter input", "virtual audio cable",
+                      "virtual cable")
 
-    def __init__(self, guard: Optional[AudioGuard] = None) -> None:
+    def __init__(self, config: dict,
+                 guard: Optional[AudioGuard] = None) -> None:
+        self.config = config
         self._lock = threading.Lock()
         self._lifecycle_lock = threading.Lock()
         self._queue: queue.Queue[bytes] = queue.Queue(maxsize=self.QUEUE_CHUNKS)
@@ -782,15 +871,69 @@ class PcmPlayer:
         self._thread: Optional[threading.Thread] = None
         self._stream = None
         self._accepting = False
-        self._failed = False
-        self._frames = 0
         self._guard = guard
+        self._name = ""
+        self._rate = 0
+        self._channels = 1
+        self._resampler: Optional[_LinearResampler] = None
+        self._frames = 0
+        self._queue_drops = 0
+        self._idle_drops = 0
         self._logged_first = False
+        self._warned_missing = False
 
-    def reset_failure(self) -> None:
-        """Allow a later voice session to retry after a device/driver error."""
-        with self._lock:
-            self._failed = False
+    def _wanted(self):
+        return self.config.get("virtual_mic", self.DEFAULT_NAME)
+
+    def _select_device(self, devices, hostapis) -> Optional[int]:
+        wanted = self._wanted()
+        if isinstance(wanted, int):
+            if 0 <= wanted < len(devices) and devices[wanted].get(
+                    "max_output_channels", 0) > 0:
+                return wanted
+            return None
+        needle = str(wanted).strip().lower() or self.DEFAULT_NAME.lower()
+        matches = []
+        for token in (needle,) + (self.FALLBACK_NAMES
+                                  if needle == self.DEFAULT_NAME.lower() else ()):
+            for index, device in enumerate(devices):
+                if device.get("max_output_channels", 0) <= 0:
+                    continue
+                if token in str(device.get("name", "")).lower():
+                    matches.append(index)
+            if matches:
+                break
+        if not matches:
+            return None
+
+        def score(index: int) -> int:
+            # VB-CABLE appears once per PortAudio host API. Prefer WASAPI
+            # shared mode: lowest latency and the native endpoint mix format.
+            try:
+                api = str(hostapis[devices[index].get("hostapi", 0)]["name"])
+            except (IndexError, KeyError, TypeError):
+                return 0
+            api = api.lower()
+            if "wasapi" in api:
+                return 2
+            if "directsound" in api:
+                return 1
+            return 0
+
+        return max(matches, key=score)
+
+    def _log_missing(self, devices) -> None:
+        if self._warned_missing:
+            return
+        self._warned_missing = True
+        log(f"audio: virtual microphone output {self._wanted()!r} not found")
+        log("audio: install VB-CABLE (https://vb-audio.com/Cable/), then select "
+            "\"CABLE Output (VB-Audio Virtual Cable)\" as the microphone in "
+            "WeType's voice settings")
+        names = [str(d.get("name", "")) for d in devices
+                 if d.get("max_output_channels", 0) > 0]
+        if names:
+            log("audio: available outputs: " + ", ".join(names[:6]))
 
     def is_active(self) -> bool:
         with self._lock:
@@ -800,8 +943,6 @@ class PcmPlayer:
     def start(self) -> bool:
         with self._lifecycle_lock:
             with self._lock:
-                if self._failed:
-                    return False
                 if self._thread and self._thread.is_alive():
                     if self._accepting:
                         return True
@@ -810,8 +951,52 @@ class PcmPlayer:
             if thread and thread.is_alive():
                 thread.join(1.0)
                 if thread.is_alive():
-                    log("audio: previous playback worker did not stop")
+                    log("audio: previous worker did not stop")
                     return False
+            try:
+                import sounddevice as sd
+            except ImportError:
+                log("audio: sounddevice is not installed "
+                    "(python -m pip install -r pc/requirements.txt)")
+                return False
+            devices = sd.query_devices()
+            index = self._select_device(devices, sd.query_hostapis())
+            if index is None:
+                self._log_missing(devices)
+                return False
+            device = devices[index]
+            name = str(device.get("name", ""))
+            try:
+                rate = int(round(float(device.get("default_samplerate", 48000))))
+            except (TypeError, ValueError):
+                rate = 48000
+            channels = 1 if int(device.get("max_output_channels", 1)) < 2 else 2
+            if self._guard is not None:
+                self._guard.prepare(name)
+            stream = None
+            last_error = None
+            for candidate in (rate, 48000, 44100):
+                try:
+                    stream = sd.RawOutputStream(
+                        device=index, samplerate=candidate, channels=channels,
+                        dtype="int16", blocksize=0)
+                    stream.start()
+                    rate = candidate
+                    break
+                except Exception as error:
+                    last_error = error
+                    if stream is not None:
+                        try:
+                            stream.close()
+                        except Exception:
+                            pass
+                        stream = None
+            if stream is None:
+                log(f"audio: cannot open virtual microphone {name!r} "
+                    f"({last_error})")
+                if self._guard is not None:
+                    self._guard.restore()
+                return False
             with self._lock:
                 self._stop.clear()
                 while True:
@@ -819,63 +1004,77 @@ class PcmPlayer:
                         self._queue.get_nowait()
                     except queue.Empty:
                         break
-                try:
-                    import sounddevice as sd
-                except ImportError:
-                    log("audio: sounddevice is not installed; WeType will use the "
-                        "PC microphone (python -m pip install -r "
-                        "pc/requirements.txt)")
-                    self._failed = True
-                    return False
-                if self._guard is not None:
-                    self._guard.prepare()
-                try:
-                    stream = sd.RawOutputStream(
-                        samplerate=self.SAMPLE_RATE, channels=1, dtype="int16",
-                        blocksize=self.BLOCK_FRAMES,
-                    )
-                    stream.start()
-                except Exception as error:  # PortAudio / device configuration
-                    log(f"audio: cannot open default output ({error}); WeType will "
-                        "use the PC microphone")
-                    self._failed = True
-                    return False
-                self._stream = stream
+                self._name = name
+                self._rate = rate
+                self._channels = channels
+                self._resampler = _LinearResampler(self.SOURCE_RATE, rate)
                 self._accepting = True
                 self._frames = 0
+                self._idle_drops = 0
                 self._logged_first = False
+                self._stream = stream
                 self._thread = threading.Thread(
                     target=self._run, args=(stream,), daemon=True,
                     name="kfb24-audio",
                 )
                 self._thread.start()
-                log(f"audio: board PCM output ready at {self.SAMPLE_RATE} Hz")
-                return True
+            log(f"audio: board microphone -> {name} at {rate} Hz, "
+                f"{channels} ch")
+            return True
 
     def write(self, pcm: bytes) -> None:
         if not pcm:
             return
-        if not self.is_active():
-            if not self.start():
-                return
+        with self._lock:
+            if not self._accepting or self._resampler is None:
+                self._idle_drops += 1
+                drops = self._idle_drops
+                resampler = None
+            else:
+                drops = 0
+                resampler = self._resampler
+                channels = self._channels
+        if resampler is None:
+            if drops == 1 or drops % 100 == 0:
+                log(f"audio: {drops} block(s) arrived before the capture "
+                    "stream was open; the board started streaming early")
+            return
+        if len(pcm) % 2:
+            pcm = pcm[:-1]
+        samples = array("h")
+        samples.frombytes(pcm)
+        if sys.byteorder != "little":
+            samples.byteswap()
+        mono = resampler.process(samples)
+        if channels == 2:
+            out = array("h", [0]) * (2 * len(mono))
+            out[0::2] = mono
+            out[1::2] = mono
+        else:
+            out = mono
+        data = out.tobytes()
         with self._lock:
             if not self._accepting:
                 return
             try:
-                self._queue.put_nowait(pcm)
+                self._queue.put_nowait(data)
             except queue.Full:
+                self._queue_drops += 1
+                if self._queue_drops == 1 or self._queue_drops % 25 == 0:
+                    log(f"audio: queue full, dropped {self._queue_drops} "
+                        "chunk(s)")
                 try:
                     self._queue.get_nowait()
                 except queue.Empty:
                     pass
                 try:
-                    self._queue.put_nowait(pcm)
+                    self._queue.put_nowait(data)
                 except queue.Full:
                     pass
             self._frames += 1
             if not self._logged_first:
                 self._logged_first = True
-                log("audio: board PCM streaming")
+                log("audio: board microphone streaming")
 
     def _run(self, stream) -> None:
         try:
@@ -891,7 +1090,7 @@ class PcmPlayer:
                 try:
                     stream.write(pcm)
                 except Exception as error:
-                    log(f"audio: playback failed: {error}")
+                    log(f"audio: streaming failed: {error}")
                     break
         finally:
             with self._lock:
@@ -927,200 +1126,14 @@ class PcmPlayer:
                     stream.close()
                 except Exception:
                     pass
-            if self._guard is not None:
-                self._guard.restore()
-
-
-class PcMicMonitor:
-    """Route the PC microphone to the default output for BLE-only voice.
-
-    BLE NUS cannot carry board PCM.  WeType still expects its configured input
-    (Stereo Mix, per the bridge setup), so play the physical microphone on the
-    default output; Stereo Mix then exposes it to WeType.  The duplex stream
-    runs entirely in PortAudio's callback thread.
-    """
-
-    LOOPBACK = ("立体声混音", "stereo mix", "what u hear", "loopback", "混音")
-
-    def __init__(self, config: dict, guard: AudioGuard) -> None:
-        self.config = config
-        self.guard = guard
-        self._lock = threading.Lock()
-        self._stream = None
-        self._frames = 0
-        self._input_name = ""
-        self._output_name = ""
-
-    @classmethod
-    def _is_loopback(cls, name: str) -> bool:
-        low = name.lower()
-        return any(token in low for token in cls.LOOPBACK)
-
-    @staticmethod
-    def _device_name(devices, index: int) -> str:
-        try:
-            return str(devices[index]["name"])
-        except (IndexError, KeyError, TypeError):
-            return ""
-
-    def _select_input(self, sd, devices) -> Optional[int]:
-        wanted = self.config.get("pc_mic")
-        if isinstance(wanted, int):
-            name = self._device_name(devices, wanted)
-            if name and devices[wanted]["max_input_channels"] > 0:
-                return wanted
-        if isinstance(wanted, str) and wanted.strip():
-            needle = wanted.strip().lower()
-            for index, device in enumerate(devices):
-                name = str(device.get("name", ""))
-                if needle in name.lower() and device.get("max_input_channels", 0) > 0:
-                    return index
-        default_in = getattr(sd.default, "device", (None, None))[0]
-        if isinstance(default_in, int):
-            name = self._device_name(devices, default_in)
-            if name and not self._is_loopback(name):
-                return default_in
-
-        def score(device) -> int:
-            name = str(device.get("name", "")).lower()
-            if device.get("max_input_channels", 0) <= 0 or self._is_loopback(name):
-                return -1
-            points = 0
-            if "麦克风" in name or "microphone" in name:
-                points += 4
-            if "mic" in name:
-                points += 1
-            if "array" in name or "阵列" in name:
-                points += 1
-            # Prefer the default host API; WDM-KS often rejects duplex streams.
-            if device.get("hostapi") == getattr(sd.default, "hostapi", None):
-                points += 3
-            elif device.get("hostapi") == 3:
-                points -= 2
-            return points
-
-        best = max(range(len(devices)), key=lambda i: score(devices[i]), default=None)
-        if best is not None and score(devices[best]) >= 0:
-            return best
-        return None
-
-    def _select_output(self, sd, devices) -> Optional[int]:
-        wanted = self.config.get("pc_output")
-        if isinstance(wanted, int):
-            name = self._device_name(devices, wanted)
-            if name and devices[wanted]["max_output_channels"] > 0:
-                return wanted
-        if isinstance(wanted, str) and wanted.strip():
-            needle = wanted.strip().lower()
-            for index, device in enumerate(devices):
-                name = str(device.get("name", ""))
-                if needle in name.lower() and device.get("max_output_channels", 0) > 0:
-                    return index
-        default_out = getattr(sd.default, "device", (None, None))[1]
-        if isinstance(default_out, int):
-            name = self._device_name(devices, default_out)
-            if name and not self._is_loopback(name):
-                return default_out
-        for index, device in enumerate(devices):
-            if device.get("max_output_channels", 0) > 0:
-                return index
-        return None
-
-    @staticmethod
-    def _pick_rate(sd, input_index: int, output_index: int) -> int:
-        try:
-            preferred = int(float(sd.query_devices(input_index)["default_samplerate"]))
-        except Exception:
-            preferred = 44100
-        for rate in (preferred, 48000, 44100, 32000, 16000):
-            try:
-                sd.check_input_settings(device=input_index, channels=1,
-                                        dtype="int16", samplerate=rate)
-                sd.check_output_settings(device=output_index, channels=1,
-                                         dtype="int16", samplerate=rate)
-                return rate
-            except Exception:
-                continue
-        return 48000
-
-    def _callback(self, indata, outdata, frames, time_info, status) -> None:
-        if status:
-            pass
-        try:
-            outdata[:] = indata
-            self._frames += frames
-        except Exception:
-            outdata[:] = b"\x00" * len(outdata)
-
-    def is_active(self) -> bool:
-        with self._lock:
-            stream = self._stream
-        return bool(stream is not None and stream.active)
-
-    def start(self) -> bool:
-        with self._lock:
-            if self._stream is not None:
-                return True
-        try:
-            import sounddevice as sd
-        except ImportError:
-            log("audio: sounddevice is not installed; PC microphone fallback "
-                "is unavailable")
-            return False
-        devices = sd.query_devices()
-        input_index = self._select_input(sd, devices)
-        output_index = self._select_output(sd, devices)
-        if input_index is None or output_index is None:
-            log("audio: no physical microphone or output device found; "
-                "WeType will receive silence")
-            return False
-        input_name = self._device_name(devices, input_index)
-        output_name = self._device_name(devices, output_index)
-        self.guard.prepare(output_name=output_name, mic_name=input_name)
-        rate = self._pick_rate(sd, input_index, output_index)
-        try:
-            import numpy  # noqa: F401 - Stream's ndarray callback needs it
-            stream = sd.Stream(
-                device=(input_index, output_index), samplerate=rate,
-                channels=(1, 1), dtype=("int16", "int16"), blocksize=0,
-                latency="high", callback=self._callback,
-            )
-            stream.start()
-        except Exception as error:
-            log(f"audio: cannot open PC microphone fallback ({error})")
-            self.guard.restore()
-            return False
-        with self._lock:
-            self._stream = stream
-            self._frames = 0
-            self._input_name = input_name
-            self._output_name = output_name
-        log(f"audio: PC microphone fallback: {input_name} -> "
-            f"{output_name} at {rate} Hz")
-        return True
-
-    def stop(self) -> None:
-        with self._lock:
-            stream = self._stream
-            self._stream = None
-        if stream is not None:
-            try:
-                stream.stop()
-                stream.close()
-            except Exception:
-                pass
-        self.guard.restore()
 
 
 class Actions:
-    def __init__(self, config: dict, dry_run: bool = False,
-                 pc_mic_fallback: bool = False):
+    def __init__(self, config: dict, dry_run: bool = False):
         self.config = config
         self.dry_run = dry_run
-        self.pc_mic_fallback = pc_mic_fallback
         self.guard = AudioGuard()
-        self.audio = PcmPlayer(self.guard)
-        self.mic = PcMicMonitor(config, self.guard)
+        self.audio = VirtualMic(config, self.guard)
         self._voice_lock = threading.Lock()
         self._voice_keys: list[tuple[int, bool]] = []
         self._voice_timer: Optional[threading.Timer] = None
@@ -1205,13 +1218,14 @@ class Actions:
         return False
 
     def _start_audio(self) -> bool:
-        if self.pc_mic_fallback:
-            return self.mic.start()
-        return self.audio.start()
+        if self.audio.start():
+            return True
+        log("voice: WeType was not activated because the virtual microphone "
+            "is unavailable")
+        return False
 
     def _stop_audio(self) -> None:
         self.audio.stop()
-        self.mic.stop()
         self.guard.restore()
 
     def _release_voice_locked(self, reason: str) -> bool:
@@ -1230,6 +1244,45 @@ class Actions:
         else:
             log(f"voice: release failed ({reason})")
         return ok
+
+    def audio_ended(self) -> None:
+        """The board stopped capturing without being asked: end our side too.
+
+        The board sends END only when its own 60 s cap, a microphone read
+        error, or a transport failure ends the capture. Leaving the WeType
+        hotkey latched there would make the next press toggle it off instead
+        of starting a new session, and WeType would keep listening to silence.
+        An explicit stop reaches us as a `voice` command first, which already
+        released the hotkey, so this path then only stops a closing stream.
+        """
+        with self._voice_lock:
+            timer = self._voice_timer
+            self._voice_timer = None
+            if timer is not None:
+                timer.cancel()
+            keys = self._voice_keys
+            self._voice_keys = []
+            self._stop_audio()
+        if not keys:
+            return
+        if release_keys(keys):
+            log("voice: board ended the capture session")
+        else:
+            log("voice: release failed (board ended the capture session)")
+
+    def _end_voice_session(self, reason: str) -> None:
+        """End a latched/tap voice session because another action ran.
+
+        The board stops its own capture when any other button is pressed, and
+        it cannot send END for that stop (the stop is local, so END would race
+        the command the same button sends).  Without this, WeType stays latched
+        on silence and the next voice press toggles it off instead of on.
+        """
+        with self._voice_lock:
+            if self._voice_keys:
+                self._release_voice_locked(reason)
+            else:
+                self._stop_audio()
 
     def _voice_timeout(self) -> None:
         with self._voice_lock:
@@ -1252,10 +1305,10 @@ class Actions:
             log("voice: voice_hotkey is disabled")
             return False
 
-        self.audio.reset_failure()
         mode = str(self.config.get("voice_mode", "latch")).strip().lower()
         if mode in ("tap", "toggle", "once"):
-            self._start_audio()
+            if not self._start_audio():
+                return False
             if hotkey.lower() in ("right-alt", "right_alt", "ralt"):
                 ok = send_right_alt_hold()
             else:
@@ -1273,7 +1326,8 @@ class Actions:
         with self._voice_lock:
             if self._voice_keys:
                 return self._release_voice_locked("stopped")
-            self._start_audio()
+            if not self._start_audio():
+                return False
             if not press_keys(keys):
                 release_keys(keys)
                 self._stop_audio()
@@ -1297,8 +1351,15 @@ class Actions:
         if name == "voice":
             return self.voice()
         if name == "ime":
+            # Commit the running WeType session under the current IME first;
+            # switching profiles mid-commit can swallow the text.
+            self._end_voice_session("ended by ime")
             return self.ime()
         if name in ("wechat", "orca", "terminal", "trae", "chrome", "edge"):
+            # End first, then act: WeType inserts into the window that had
+            # focus when the session started, so focusing later cannot move
+            # the text, and it must not commit while focus is being switched.
+            self._end_voice_session(f"ended by {name}")
             return self.launch(name)
         log(f"action: unknown command {name!r}")
         return False
@@ -1553,6 +1614,7 @@ class Bridge:
         self._listen = listen
         self._enable_tcp = enable_tcp
         self._audio_drops = 0
+        self._rx_blocks = 0
         if serial_port:
             if serial is None:
                 if not enable_ble:
@@ -1665,24 +1727,34 @@ class Bridge:
     def _on_audio_line(self, line: str, transport) -> None:
         parts = line.strip().split()
         if len(parts) == 3 and parts[2] == "END":
-            self.actions.audio.stop()
+            self.actions.audio_ended()
             return
-        if len(parts) != 5:
+        if len(parts) != 6 or parts[2] != "A":
             self._drop_audio("malformed frame")
             return
         try:
-            int(parts[2], 10)
-            crc = int(parts[3], 16)
-            pcm = base64.b64decode(parts[4], validate=True)
+            int(parts[3], 10)
+            crc = int(parts[4], 16)
+            block = base64.b64decode(parts[5], validate=True)
         except (ValueError, binascii.Error):
             self._drop_audio("bad number/base64")
             return
-        if len(pcm) != 1024:
-            self._drop_audio(f"unexpected chunk size {len(pcm)}")
+        if len(block) != ADPCM_BYTES:
+            self._drop_audio(f"unexpected block size {len(block)}")
             return
-        if (zlib.crc32(pcm) & 0xFFFFFFFF) != crc:
+        if (zlib.crc32(block) & 0xFFFFFFFF) != crc:
             self._drop_audio("CRC mismatch")
             return
+        pcm = adpcm_decode(block)
+        if pcm is None:
+            self._drop_audio("bad ADPCM block")
+            return
+        self._rx_blocks += 1
+        if self.verbose and (self._rx_blocks == 1 or
+                             self._rx_blocks % 25 == 0):
+            peak = max(abs(v) for v in
+                       struct.unpack("<%dh" % (len(pcm) // 2), pcm))
+            log(f"audio: rx #{self._rx_blocks} peak={peak}")
         self.actions.audio.write(pcm)
 
     def _drop_audio(self, reason: str) -> None:
@@ -1771,6 +1843,28 @@ class Bridge:
         log("bridge: stopped")
 
 
+def list_audio_devices() -> int:
+    try:
+        import sounddevice as sd
+    except ImportError:
+        log("sounddevice is missing: python -m pip install -r pc/requirements.txt")
+        return 2
+    try:
+        devices = sd.query_devices()
+    except Exception as error:
+        log(f"audio: cannot enumerate devices ({error})")
+        return 2
+    for index, device in enumerate(devices):
+        name = str(device.get("name", ""))
+        ins = int(device.get("max_input_channels", 0))
+        outs = int(device.get("max_output_channels", 0))
+        marker = ""
+        if outs and "cable input" in name.lower():
+            marker = "  <- virtual microphone target"
+        log(f"{index}: {name} (in={ins}, out={outs}){marker}")
+    return 0
+
+
 def list_serial_ports() -> None:
     if list_ports is None:
         log("pyserial is not installed: python -m pip install -r pc/requirements.txt")
@@ -1824,8 +1918,7 @@ def run_bridge(args, config: dict) -> int:
         log("serial: disabled (--ble-only)")
     elif not port:
         log("serial: board not found; continuing with BLE/TCP")
-    actions = Actions(config, dry_run=args.dry_run,
-                      pc_mic_fallback=(port is None))
+    actions = Actions(config, dry_run=args.dry_run)
     try:
         bridge = Bridge(actions, port, args.tcp_port, args.listen, args.verbose,
                         enable_ble=args.ble, ble_name=args.ble_name)
@@ -1871,6 +1964,8 @@ def main() -> int:
                         help="do not send input or launch apps")
     parser.add_argument("--list-ports", action="store_true",
                         help="list serial ports and exit")
+    parser.add_argument("--list-audio", action="store_true",
+                        help="list audio devices and exit")
     parser.add_argument("--configure", action="store_true",
                         help="send Wi-Fi/bridge settings over USB and exit")
     parser.add_argument("--ssid", help="Wi-Fi SSID for --configure")
@@ -1891,6 +1986,8 @@ def main() -> int:
     if args.list_ports:
         list_serial_ports()
         return 0
+    if args.list_audio:
+        return list_audio_devices()
     if serial is None and not args.test_action and not args.ble:
         log("pyserial is missing: python -m pip install -r pc/requirements.txt")
         return 2
@@ -1900,8 +1997,7 @@ def main() -> int:
 
     config = load_config(args.config)
     if args.test_action:
-        actions = Actions(config, dry_run=args.dry_run,
-                          pc_mic_fallback=True)
+        actions = Actions(config, dry_run=args.dry_run)
         try:
             ok = actions.run(args.test_action)
         finally:

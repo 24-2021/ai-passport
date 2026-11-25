@@ -1,5 +1,4 @@
 pyserial>=3.5
 bleak>=0.22,<1.0
 sounddevice>=0.5
-numpy>=1.21
 pycaw>=20240210

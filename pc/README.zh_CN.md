@@ -11,13 +11,13 @@ USB 串口、Wi-Fi TCP，并可选监听 BLE；每两秒发送一次 `KFB24 HELL
 ## 环境要求
 
 - Windows 10/11。
-- Python 3.9 或更新版本，并安装 `pyserial`、`sounddevice`、`numpy`、`pycaw`；使用
+- Python 3.9 或更新版本，并安装 `pyserial`、`sounddevice`、`pycaw`；使用
   `--ble` 时还需要 `bleak`：`python -m pip install -r pc/requirements.txt`
-- `pycaw` 让桥接在语音会话开始时临时解除 Windows 输出、“立体声混音”和麦克风的
-  静音，并在结束后恢复原来的静音与音量状态。
+- `pycaw` 让桥接在语音会话开始时临时解除虚拟麦克风播放端点的静音，并在结束后
+  恢复原来的静音与音量状态。
 - 已安装并启用微信输入法（WeType TSF 输入法）。
-- 板载麦克风语音需要启用 Windows“立体声混音”并设为默认录音设备，同时在微信输入法
-  的语音设置中选择它。
+- 已安装一次 VB-CABLE（管理员权限，安装后重启），并在微信输入法语音设置中把
+  麦克风选为 `CABLE Output (VB-Audio Virtual Cable)`。
 - 程序路径符合下方默认值，或通过 JSON 覆盖。
 
 ## 查找开发板并配置 Wi-Fi
@@ -86,7 +86,7 @@ python pc/kfb24_bridge.py --ble-only
 
 `--ble-only` 隐含 `--ble` 并跳过串口自动查找。开发板只需供电，Windows 蓝牙必须打开。
 `pc\start_bridge.cmd --ble-only` 同样可用。连接后开发板显示 `ble 1 bridge`，八个动作
-及其 ACK 都走 NUS。此模式不传板载 PCM，语音动作使用电脑麦克风。
+及其 ACK 都走 NUS；语音动作同样通过 BLE 推流板载麦克风。
 
 BLE NUS 通道没有应用层认证。范围内任何能连接 `kfb24` 的 BLE central 都能发送与
 桥接相同的命令，因此只应在可信环境启用 `--ble`。
@@ -95,7 +95,7 @@ BLE NUS 通道没有应用层认证。范围内任何能连接 `kfb24` 的 BLE c
 
 | 开发板动作 | 电脑端效果 |
 | --- | --- |
-| `voice` | USB 时开发板推流板载麦克风，桥接播放到默认输出并按住微信输入法语音快捷键（默认 `Ctrl+Win`）；BLE/Wi-Fi 时改为把电脑麦克风循环播放到默认输出。再次按下同时停止。使用微信输入法，不再发送 Windows `Win+H`。 |
+| `voice` | 开发板通过当前通道（USB、BLE 或 Wi-Fi）推流板载麦克风到 VB-CABLE 的 `CABLE Input`，微信输入法从 `CABLE Output` 取音；同时按住微信输入法语音快捷键（默认 `Ctrl+Win`）。再次按下同时停止。使用微信输入法，不再发送 Windows `Win+H`。 |
 | `ime` | 激活微信输入法 TSF 配置（`{86598FB9-…}` / `{607FDF85-…}`，langid `0x0804`）；失败时发送配置的热键。 |
 | `wechat` | 按“启动 / 恢复 / 最小化 / 聚焦”切换微信窗口。 |
 | `orca` | 按“启动 / 恢复 / 最小化 / 聚焦”切换 Orca。 |
@@ -104,26 +104,40 @@ BLE NUS 通道没有应用层认证。范围内任何能连接 `kfb24` 的 BLE c
 | `chrome` | 按“启动 / 恢复 / 最小化 / 聚焦”切换 Chrome。 |
 | `edge` | 按“启动 / 恢复 / 最小化 / 聚焦”切换 Edge。 |
 
-`voice` 请先把光标放进目标位置。USB 连接时，开发板用 ES8311 麦克风采集 16 kHz
-单声道 PCM，按 base64 + CRC32 行协议通过 USB 发送，桥接用 `sounddevice` 播放到
-默认输出设备。Windows 必须启用“立体声混音”并设为默认录音设备，微信输入法必须把
-麦克风选为“立体声混音”；否则微信输入法仍会录电脑麦克风。
+`voice` 请先把光标放进目标位置。开发板用 ES8311 麦克风采集 16 kHz 单声道音频，
+按 40 ms 一块（640 个采样、323 字节）编码为 IMA ADPCM，并带 CRC32 通过当前通道
+（USB、BLE 或 Wi-Fi）发送。桥接逐块解码，重采样到虚拟声卡端点的采样率，需要时
+复制为双声道，再写入 VB-CABLE 的“CABLE Input”播放端点。微信输入法从对应的
+“CABLE Output”录音端点取音并自行完成语音识别，因此板载麦克风取代电脑麦克风，
+不需要任何其他语音程序。
 
-启用方法：**声音设置 → 更多声音设置 → 录制**，在空白处右键勾选“显示禁用的设备”，
-再右键“立体声混音”选择“启用”和“设为默认设备”。随后在微信输入法语音设置中选择
-“立体声混音”，或确认“自动检测”解析到它。
+开发板只在**自行**结束录音时发送 `KFB24 AUDIO END`：达到 60 秒上限、麦克风读取
+失败或链路断开。桥接收到后松开按住的微信输入法快捷键并关闭音频流，避免板端异常
+让微信输入法一直“聆听”静音。正常按键停止不会发送 `END`。
 
-语音会话开始时，桥接还会解除默认输出、“立体声混音”和物理麦克风的静音；音量为 0
-时提高到 35%。被静音的端点在 PortAudio 里能正常打开，却只会产生静音，看起来像
-开发板坏了。会话结束后桥接恢复原来的静音与音量。自动修复依赖 `pycaw`；缺少时
-桥接会打印警告，不修改端点状态。
+录音过程中按开发板上的其他动作键同样会结束本次录音：板端在本地停止采集，桥接收到
+该命令后立即松开语音快捷键（日志 `voice: ended by orca`），然后再执行该动作。
 
-BLE/Wi-Fi 语音时，桥接选择一个真实麦克风（排除“立体声混音”等回环设备），以
-44.1/48 kHz 播放到默认输出，同时按住微信输入法快捷键。自动选择不合适时，用
-`pc_mic` 或 `pc_output` 指定设备。
+微信输入法在**按下快捷键时**就确定了文字要输入到哪个窗口，而不是在文字生成时：录音
+中途切换焦点，识别结果仍然留在开始时聚焦的那个窗口。所以请先聚焦目标窗口，再按
+`voice` 开始录音——开发板上的程序键（`orca`、`chrome`、`edge`、`trae`、`wechat`）
+就是用来把目标切到前台的，但它们无法改变已经开始的这次录音的投递目标。
 
-缺少 `sounddevice` 或 PortAudio 无法打开默认输出时，桥接会打印原因，但仍会锁存
-微信输入法快捷键。
+识别出的文字不会写入剪贴板，桥接也无法指定把它投递给某个程序：文字落在哪里完全由
+微信输入法决定。
+
+VB-CABLE 只需安装一次：https://vb-audio.com/Cable/（管理员权限，安装后重启）。
+在微信输入法的“语音设置”中把麦克风选为
+`CABLE Output (VB-Audio Virtual Cable)`。用下面的命令查看端点：
+
+```powershell
+python pc/kfb24_bridge.py --list-audio
+```
+
+不再使用 Windows“立体声混音”和电脑麦克风。找不到 `CABLE Input` 时，`voice` 会
+打印安装说明并且不按微信输入法快捷键。会话开始时桥接会在需要时解除该播放端点的
+静音（音量为 0 时提高到 35%），结束后恢复原状态；自动修复依赖 `pycaw`，缺少时
+只打印警告。
 
 桥接会在 `voice_max_seconds`（默认 60 秒）后自动松开，并在退出时松开，避免开发板
 或桥接失联后 `Ctrl`/`Win` 卡住。识别出的文字仍进入当前焦点输入框。
@@ -147,15 +161,13 @@ BLE/Wi-Fi 语音时，桥接选择一个真实麦克风（排除“立体声混�
   "voice_hotkey": "ctrl+win",
   "voice_mode": "latch",
   "voice_max_seconds": 60,
-  "pc_mic": "麦克风阵列",
-  "pc_output": "扬声器",
+  "virtual_mic": "CABLE Input",
   "ime_hotkey": "ctrl+space"
 }
 ```
 
-`pc_mic` 与 `pc_output` 可填 `sounddevice.query_devices()` 里的设备序号，或设备名的
-不区分大小写子串。它们只影响 BLE/Wi-Fi 的电脑麦克风回退；USB 语音仍使用开发板的
-PCM 推流。
+`virtual_mic` 可填 `sounddevice.query_devices()` 里的设备序号，或设备名的不区分
+大小写子串；默认指向微信输入法所录端点对应的播放端点。
 
 `voice_mode` 默认为 `"latch"`：第一次 `voice` 按住快捷键，第二次松开。微信输入法
 使用“启动语音输入”模式时改为 `"tap"`。`voice_max_seconds` 是自动松开秒数，设为
@@ -177,15 +189,18 @@ PCM 推流。
   其他 central 占用唯一的 BLE 连接。
 - 微信输入法激活失败：确认输入法已安装并启用；桥接会改发 `ime_hotkey` 热键。
 - `voice` 没反应：先聚焦输入框，把微信输入法设为“按住说话”，把语音快捷键设为与
-  `voice_hotkey` 一致，并确认微信输入法正在运行。若使用“启动语音输入”模式，把
-  `"voice_mode"` 设为 `"tap"`。
-- `voice` 识别为静音：查看 `audio:` 日志。端点原本被静音时应出现 `unmuted ...`，
-  随后应是 `board PCM streaming`（USB）或
-  `PC microphone fallback: <麦克风> -> <输出>`（BLE/Wi-Fi）。启用“立体声混音”并
-  设为默认录音设备，再在微信输入法中选择它。安装 `sounddevice`、`numpy`、`pycaw`；
-  缺少 `pycaw` 时被静音的端点不会被解除。
-- USB 时 `voice` 识别成环境声而不是板载麦克风：板载音频只走 USB，但当前可能仍走
-  BLE/Wi-Fi；确认 `usb:` 是活动通道，或用 `pc_mic` 换一个回退麦克风。
+  `voice_hotkey` 一致，并确认微信输入法正在运行。若日志提示找不到虚拟麦克风播放
+  端点，安装 VB-CABLE 并在微信输入法中选择 `CABLE Output`。若使用“启动语音输入”
+  模式，把 `"voice_mode"` 设为 `"tap"`。
+- `voice` 识别为静音：正常会话应打印 `board microphone -> ... at ... Hz` 和
+  `board microphone streaming`。用 `--list-audio` 确认 `CABLE Input` 存在，并在
+  微信输入法语音设置中选择 `CABLE Output`。安装 `sounddevice` 与 `pycaw`。
+- BLE/Wi-Fi 语音断续：`audio: dropped N frame(s)` 表示链路丢块或校验失败。拉近
+  开发板与电脑的距离、减少其他 BLE 流量，或改用 USB。
 - `voice` 后 `Ctrl`/`Win` 卡住：再按一次开发板“语音输入”，或等待
-  `voice_max_seconds` 自动松开；桥接退出时也会松开。
+  `voice_max_seconds` 自动松开；桥接退出时、收到开发板 `END` 时，以及任何其他
+  动作键结束会话时也会松开。
+- `audio: N block(s) arrived before the capture stream was open`：会话开始时出现
+  一两块属于正常现象，因为按下语音键后开发板立即开始推流。数字持续增长说明开发板
+  在推流但电脑端没有会话；按一次 `voice` 重新对齐。
 - 程序被打开两次：先关闭多余的窗口；桥接会聚焦该进程找到的第一个可见顶层窗口。

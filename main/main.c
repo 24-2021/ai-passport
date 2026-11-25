@@ -41,7 +41,7 @@ static void input_task(void *arg) {
 }
 
 void app_main(void) {
-    ESP_LOGI(TAG, "kfb24 1.0.0 by 24 启动");
+    ESP_LOGI(TAG, "kfb24 1.0.2 by 24 启动");
 
     esp_err_t err = bsp_i2c_init();
     if (err != ESP_OK) ESP_LOGW(TAG, "I2C 初始化失败: %s", esp_err_to_name(err));

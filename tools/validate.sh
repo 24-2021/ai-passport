@@ -90,6 +90,10 @@ run_static_checks() {
         tests/test_kfb24_proto.c main/kfb24_proto.c \
         -o "${test_dir}/test_kfb24_proto"
     "${test_dir}/test_kfb24_proto"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_kfb24_adpcm.c main/kfb24_adpcm.c \
+        -o "${test_dir}/test_kfb24_adpcm"
+    "${test_dir}/test_kfb24_adpcm"
     "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Icomponents/bsp/src \
         tests/test_bsp_display_rounding.c components/bsp/src/bsp_display_rounding.c \
         -o "${test_dir}/test_bsp_display_rounding"

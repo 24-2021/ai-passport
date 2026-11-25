@@ -30,7 +30,7 @@
 #define USB_LINE_MAX KFB24_PROTO_MAX_LINE
 
 static const char *TAG = "kfb24_link";
-static const char *FW_VERSION = "kfb24/1.0.0";
+static const char *FW_VERSION = "kfb24/1.0.2";
 
 typedef struct {
     char name[16];
@@ -51,6 +51,7 @@ typedef struct {
 static kfb24_cfg_t s_cfg;
 static SemaphoreHandle_t s_status_lock;
 static SemaphoreHandle_t s_usb_lock;
+static SemaphoreHandle_t s_tcp_lock;
 static kfb24_link_status_t s_status;
 static QueueHandle_t s_cmd_q;
 
@@ -141,13 +142,19 @@ static bool usb_write(const char *line, size_t len) {
     return written == (int)len;
 }
 
+static bool tcp_write(const char *line, size_t len);
+
 bool kfb24_link_audio_ready(void) {
-    return s_usb_driver && s_usb_connected && s_bridge_usb;
+    if (s_bridge_usb) return s_usb_driver && s_usb_connected;
+    if (s_bridge_ble) return kfb24_ble_connected();
+    return s_bridge_online && s_fd >= 0;
 }
 
 bool kfb24_link_audio_write(const char *line, size_t len) {
     if (!line || len == 0 || !kfb24_link_audio_ready()) return false;
-    return usb_write(line, len);
+    if (s_bridge_usb) return usb_write(line, len);
+    if (s_bridge_ble) return kfb24_ble_send(line, len);
+    return tcp_write(line, len);
 }
 
 static void tcp_close(void) {
@@ -162,6 +169,11 @@ static void tcp_close(void) {
 
 static bool tcp_write(const char *line, size_t len) {
     if (s_fd < 0) return false;
+    bool locked = false;
+    if (s_tcp_lock) {
+        locked = xSemaphoreTake(s_tcp_lock, pdMS_TO_TICKS(1000)) == pdTRUE;
+        if (!locked) return false;
+    }
     size_t off = 0;
     int waits = 0;
     while (off < len) {
@@ -175,9 +187,11 @@ static bool tcp_write(const char *line, size_t len) {
         } else {
             ESP_LOGW(TAG, "TCP 发送失败: errno=%d", errno);
             tcp_close();
+            if (locked) xSemaphoreGive(s_tcp_lock);
             return false;
         }
     }
+    if (locked) xSemaphoreGive(s_tcp_lock);
     return true;
 }
 
@@ -677,9 +691,10 @@ void kfb24_link_start(const kfb24_cfg_t *cfg) {
 
     s_status_lock = xSemaphoreCreateMutex();
     s_usb_lock = xSemaphoreCreateMutex();
+    s_tcp_lock = xSemaphoreCreateMutex();
     s_cmd_q = xQueueCreate(8, sizeof(cmd_item_t));
     s_net_q = xQueueCreate(8, sizeof(net_evt_t));
-    if (!s_status_lock || !s_usb_lock || !s_cmd_q || !s_net_q) {
+    if (!s_status_lock || !s_usb_lock || !s_tcp_lock || !s_cmd_q || !s_net_q) {
         ESP_LOGE(TAG, "链路队列/锁创建失败");
         return;
     }

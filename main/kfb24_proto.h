@@ -8,8 +8,10 @@
 //                                      PC -> board (hex-encoded strings)
 //   KFB24 STATE <usb|wifi|ble> <0|1> [detail]
 //                                      board -> PC
-//   KFB24 AUDIO <seq> <crc32> <base64> board -> PC (USB only, 16 kHz mono s16le)
-//   KFB24 AUDIO END                    board -> PC (USB only)
+//   KFB24 AUDIO A <seq> <crc32> <base64>
+//                                      board -> PC (16 kHz mono IMA ADPCM,
+//                                      640-sample blocks, USB/BLE/Wi-Fi)
+//   KFB24 AUDIO END                    board -> PC
 //
 // Console logs share the USB Serial/JTAG port, so receivers ignore every line
 // that does not start with the exact prefix. Audio lines bypass

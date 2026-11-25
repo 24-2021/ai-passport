@@ -18,3 +18,6 @@ sdkconfig.*
 !sdkconfig.defaults
 __pycache__/
 *.pyc
+
+# Throwaway build/validation directories used by the local gate
+/.tmp-*/

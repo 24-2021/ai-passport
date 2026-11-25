@@ -10,6 +10,29 @@
 > with `CHANGELOG.zh_CN.md`. The entries currently under `Unreleased` are pending
 > review for the next release; they are not a finalized release history.
 
+## v1.0.2-kfb24 - 2026-11-25
+
+- Voice input from the board now reaches WeType on every transport. The board
+  captures its ES8311 microphone once at 16 kHz and encodes it as IMA ADPCM in
+  40 ms blocks (640 samples, 323 bytes) with a CRC32 per frame, so USB, BLE, and
+  Wi-Fi carry about a tenth of the raw PCM rate.
+- The PC bridge decodes each block, resamples it to the virtual cable's endpoint
+  rate, duplicates it to stereo when required, and writes it into VB-CABLE's
+  `CABLE Input`, where WeType records `CABLE Output` and runs its own speech
+  recognition. `KFB24 AUDIO END` now means the board stopped capturing on its
+  own, so a board-side timeout, read error, or lost link cannot leave WeType
+  listening to silence.
+- Pressing any other board action during a voice session ends that session
+  immediately (logged as `voice: ended by <action>`) instead of leaving the
+  WeType hotkey latched until the 60 s auto-release.
+- Documented the insertion target rule: WeType binds its output window when the
+  hotkey is pressed, so the target must be focused before recording starts. The
+  board app actions focus their window, and recognised text is never copied to
+  the clipboard.
+- Added a reference and acknowledgement section to the README, naming the
+  upstream BSP project, the toolchain and libraries, the virtual audio cable,
+  and the reference entries the audio design was based on.
+
 ## Unreleased
 
 - Added the supplied 80-byte CW2017 profile for the specified 520 mAh cell, including content/update-flag checks, verified writes, the required restart sequence, and bounded SOC-readiness polling.

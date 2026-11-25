@@ -216,7 +216,7 @@ static void update_about(const kfb24_link_status_t *st, int soc, int mv) {
         snprintf(buf, sizeof(buf), "%s", "--");
     }
     lv_label_set_text(s_about_values[4], buf);
-    lv_label_set_text(s_about_values[5], "kfb24 1.0.0");
+    lv_label_set_text(s_about_values[5], "kfb24 1.0.2");
 }
 
 static void update_status(void) {
@@ -299,11 +299,12 @@ static void execute_action(int index) {
             set_hint("录音已停止", COL_ACCENT);
             return;
         }
-        if (st.bridge_usb && kfb24_audio_start()) {
+        if (kfb24_audio_start()) {
             s_voice_on = true;
             set_hint("录音中 · 再按停止", COL_ACCENT);
         } else {
-            set_hint("使用电脑麦克风 · 再按停止", COL_ACCENT);
+            s_pending_id = 0;
+            set_hint("发送失败 · 请重试", COL_ERROR);
         }
         return;
     }
@@ -352,7 +353,7 @@ static void about_open(void) {
     lv_obj_set_style_bg_opa(overlay, LV_OPA_COVER, 0);
 
     make_label(overlay, "关于", &kfb24_font_22, COL_TEXT, 16, 14);
-    lv_obj_t *version = make_label(overlay, "kfb24 1.0.0",
+    lv_obj_t *version = make_label(overlay, "kfb24 1.0.2",
                                    &lv_font_montserrat_14, COL_MUTED, 16, 46);
     lv_obj_set_width(version, 208);
     lv_obj_set_style_text_align(version, LV_TEXT_ALIGN_RIGHT, 0);

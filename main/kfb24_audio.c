@@ -1,6 +1,7 @@
 #include "kfb24_audio.h"
 
 #include "bsp_audio.h"
+#include "kfb24_adpcm.h"
 #include "kfb24_link.h"
 
 #include "esp_err.h"
@@ -13,11 +14,11 @@
 #include <stdio.h>
 #include <string.h>
 
-#define AUDIO_SAMPLE_RATE 16000
-#define AUDIO_CHUNK_SAMPLES 512
+#define AUDIO_SAMPLE_RATE KFB24_ADPCM_SAMPLE_RATE
+#define AUDIO_CHUNK_SAMPLES KFB24_ADPCM_SAMPLES
 #define AUDIO_CHUNK_BYTES (AUDIO_CHUNK_SAMPLES * sizeof(int16_t))
 #define AUDIO_MAX_MS 60000
-#define AUDIO_LINE_MAX 1600
+#define AUDIO_LINE_MAX 512
 #define AUDIO_CMD_START 1
 
 static const char *TAG = "kfb24_audio";
@@ -75,7 +76,9 @@ static void send_audio_end(void) {
 
 static void capture_once(uint32_t session) {
     static int16_t pcm[AUDIO_CHUNK_SAMPLES];
+    static uint8_t adpcm[KFB24_ADPCM_BYTES];
     static char line[AUDIO_LINE_MAX];
+    kfb24_adpcm_enc_t enc = {0};
     uint32_t seq = 0;
 
     if (!s_codec_ready) {
@@ -92,7 +95,9 @@ static void capture_once(uint32_t session) {
     }
 
     int64_t started = esp_timer_get_time();
-    ESP_LOGI(TAG, "录音开始 (USB PCM %d Hz)", AUDIO_SAMPLE_RATE);
+    ESP_LOGI(TAG, "录音开始 (ADPCM %d Hz, %d ms/block)", AUDIO_SAMPLE_RATE,
+             (int)(AUDIO_CHUNK_SAMPLES * 1000 / AUDIO_SAMPLE_RATE));
+    uint32_t blocks = 0;
     while (!s_stop && s_session == session) {
         if ((esp_timer_get_time() - started) >= (int64_t)AUDIO_MAX_MS * 1000) {
             ESP_LOGI(TAG, "录音达到 %d 秒上限", AUDIO_MAX_MS / 1000);
@@ -102,17 +107,30 @@ static void capture_once(uint32_t session) {
             ESP_LOGW(TAG, "读取麦克风失败，停止录音");
             break;
         }
-        uint32_t crc = crc32_le((const uint8_t *)pcm, AUDIO_CHUNK_BYTES);
-        int prefix = snprintf(line, sizeof(line), "KFB24 AUDIO %lu %08lx ",
+        // 诊断: 每秒打印一次原始 PCM 峰值, 判断 codec 是否真的采到声音。
+        int peak = 0;
+        for (int i = 0; i < AUDIO_CHUNK_SAMPLES; i++) {
+            int v = pcm[i];
+            if (v < 0) v = -v;
+            if (v > peak) peak = v;
+        }
+        if (++blocks == 1 || blocks % 25 == 0) {
+            ESP_LOGI(TAG, "麦克风电平 peak=%d", peak);
+        }
+        size_t encoded = kfb24_adpcm_encode(pcm, AUDIO_CHUNK_SAMPLES, adpcm,
+                                            sizeof(adpcm), &enc);
+        if (encoded == 0) break;
+        uint32_t crc = crc32_le(adpcm, encoded);
+        int prefix = snprintf(line, sizeof(line), "KFB24 AUDIO A %lu %08lx ",
                               (unsigned long)seq, (unsigned long)crc);
         if (prefix <= 0 || (size_t)prefix + 2 >= sizeof(line)) break;
-        size_t b64 = base64_encode((const uint8_t *)pcm, AUDIO_CHUNK_BYTES,
-                                   line + prefix, sizeof(line) - (size_t)prefix - 1);
+        size_t b64 = base64_encode(adpcm, encoded, line + prefix,
+                                   sizeof(line) - (size_t)prefix - 1);
         if (b64 == 0) break;
         size_t len = (size_t)prefix + b64;
         line[len++] = '\n';
         if (!kfb24_link_audio_write(line, len)) {
-            ESP_LOGW(TAG, "USB 音频发送失败，停止录音");
+            ESP_LOGW(TAG, "音频发送失败，停止录音");
             break;
         }
         seq++;
@@ -120,8 +138,14 @@ static void capture_once(uint32_t session) {
 
     if (s_session == session) {
         s_active = false;
-        send_audio_end();
-        ESP_LOGI(TAG, "录音结束");
+        // An explicit stop already closed the PC-side stream, so END only
+        // reports ends the PC cannot know about: the time cap, a microphone
+        // read error, or a transport failure. The bridge releases the latched
+        // WeType hotkey on END instead of leaving it listening to silence.
+        bool board_ended = !s_stop;
+        s_stop = false;
+        if (board_ended) send_audio_end();
+        ESP_LOGI(TAG, "%s", board_ended ? "录音异常结束" : "录音结束");
     }
 }
 

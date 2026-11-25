@@ -6,6 +6,7 @@
 #include "esp_mac.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "host/ble_hs.h"
 #include "host/util/util.h"
@@ -41,6 +42,7 @@ static bool s_line_overflow;
 static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static uint16_t s_rx_handle;
 static uint16_t s_tx_handle;
+static SemaphoreHandle_t s_tx_lock;
 static uint8_t s_own_addr_type;
 static bool s_started;
 
@@ -174,6 +176,19 @@ static int gap_event(struct ble_gap_event *event, void *arg) {
             s_conn_handle = event->connect.conn_handle;
             ESP_LOGI(TAG, "BLE 已连接, handle=%u",
                      (unsigned)s_conn_handle);
+            // Audio is ~8.4 KB/s at 16 kHz ADPCM; a short interval leaves
+            // headroom for notification bursts even when the central
+            // negotiates a 247-byte MTU. The central may override this.
+            struct ble_gap_upd_params fast = {
+                .itvl_min = 12,
+                .itvl_max = 24,
+                .latency = 0,
+                .supervision_timeout = 500,
+            };
+            int rc = ble_gap_update_params(s_conn_handle, &fast);
+            if (rc != 0) {
+                ESP_LOGD(TAG, "BLE 连接参数请求失败: %d", rc);
+            }
             ble_gap_adv_stop();
         } else {
             ESP_LOGW(TAG, "BLE 连接失败: %d", event->connect.status);
@@ -256,7 +271,8 @@ esp_err_t kfb24_ble_start(void) {
     if (s_started) return ESP_OK;
 
     s_rx_q = xQueueCreate(BLE_RX_QUEUE_LEN, BLE_LINE_MAX);
-    if (!s_rx_q) return ESP_ERR_NO_MEM;
+    s_tx_lock = xSemaphoreCreateMutex();
+    if (!s_rx_q || !s_tx_lock) return ESP_ERR_NO_MEM;
 
     esp_err_t err = nimble_port_init();
     if (err != ESP_OK) {
@@ -297,6 +313,15 @@ bool kfb24_ble_send(const char *data, size_t len) {
     uint16_t conn = s_conn_handle;
     if (conn == BLE_HS_CONN_HANDLE_NONE || s_tx_handle == 0) return false;
 
+    // Command replies, state frames, and audio frames are produced by
+    // different tasks. Hold the lock for the whole line so fragments from
+    // two senders can never interleave on the single TX characteristic.
+    bool locked = false;
+    if (s_tx_lock) {
+        locked = xSemaphoreTake(s_tx_lock, pdMS_TO_TICKS(2000)) == pdTRUE;
+        if (!locked) return false;
+    }
+
     uint16_t mtu = ble_att_mtu(conn);
     if (mtu < 23) mtu = 23;
     size_t chunk_size = (size_t)mtu - 3;
@@ -320,11 +345,13 @@ bool kfb24_ble_send(const char *data, size_t len) {
         }
         if (rc != 0) {
             ESP_LOGW(TAG, "BLE 通知失败: %d", rc);
+            if (locked) xSemaphoreGive(s_tx_lock);
             return false;
         }
         off += n;
         if (off < len) vTaskDelay(pdMS_TO_TICKS(4));
     }
+    if (locked) xSemaphoreGive(s_tx_lock);
     return true;
 }
 

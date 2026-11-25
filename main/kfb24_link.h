@@ -29,8 +29,9 @@ void kfb24_link_start(const kfb24_cfg_t *cfg);
 // the queue is full. Never blocks the LVGL task.
 bool kfb24_link_send_cmd(const char *name, uint32_t id);
 
-// Audio is USB-only. ready() is false until the PC bridge has identified itself
-// over USB; write() serializes the shared USB port with commands and status.
+// Audio follows the current bridge route (USB, BLE, or Wi-Fi) and uses the same
+// line framing as commands. ready() is false until a bridge is identified on
+// that route; write() serializes each transport with commands and status.
 bool kfb24_link_audio_ready(void);
 bool kfb24_link_audio_write(const char *line, size_t len);
 

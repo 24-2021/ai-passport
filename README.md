@@ -26,16 +26,16 @@ Windows 快捷控制台。三颗实体按键、一块 240×320 屏幕，通过 U
 
 - **八个动作**：语音输入、微信输入法、微信、Orca、终端、Trae、Chrome、Edge。
 - **微信输入法语音输入**：第一次按“语音输入”按住微信输入法的语音快捷键（默认
-  `Ctrl+Win`），再次按下停止；识别出的文字进入当前焦点输入框。USB 连接时，开发板
-  把板载麦克风的 16 kHz PCM 送到电脑，桥接播放到默认输出设备，微信输入法从“立体声
-  混音”采集；Wi-Fi/BLE 连接时改回电脑麦克风。默认 60 秒无操作自动松开，桥接退出时
-  也会松开。不再使用 Windows `Win+H`。
+  `Ctrl+Win`），再次按下停止；识别出的文字进入当前焦点输入框。开发板把板载
+  麦克风的 16 kHz 音频编码为 IMA ADPCM，经 USB、BLE 或 Wi-Fi 送到电脑；桥接解码后
+  写入 VB-CABLE 的 `CABLE Input`，微信输入法从 `CABLE Output` 取音并自行识别。
+  默认 60 秒无操作自动松开，桥接退出时也会松开。不再使用 Windows `Win+H`。
 - **聚焦 / 最小化 / 恢复**：微信、Orca、终端、Trae、Chrome、Edge 的动作按当前窗口
   状态切换：没有窗口就启动，已最小化就恢复并聚焦，已在前台就最小化，其他情况聚焦
   到前台，不重复启动进程。
 - **三种连接**：USB 串口、Wi-Fi TCP、BLE（Nordic UART Service）。
 - **蓝牙独立控制**：`--ble-only` 不打开 USB 串口，直接通过 BLE 连接开发板；八个
-  动作、执行结果和连接状态都走 NUS。语音动作此时使用电脑麦克风，不传板载 PCM。
+  动作、执行结果和连接状态都走 NUS，语音动作同样通过 BLE 推流板载麦克风。
 - **断线可恢复**：PC 桥接每两秒发送心跳；BLE 断开后自动重连；开发板显示当前
   通道和桥接状态。
 - **离线可用**：动作全部在本机执行，不依赖云服务；Wi-Fi 仅用于开发板与电脑通信。
@@ -82,16 +82,17 @@ python -m pip install -r pc/requirements.txt
 （或与 `voice_hotkey` 相同的组合）。桥接默认锁存按键：第一次按开发板“语音输入”
 开始说话，第二次按下停止。
 
-板载麦克风语音需要 USB 连接和 Windows“立体声混音”：
+板载麦克风语音需要一个虚拟录音端点，安装一次 VB-CABLE：
 
-1. 右键任务栏音量图标 → 声音设置 → 更多声音设置 → 录制。
-2. 在录制页空白处右键，勾选“显示禁用的设备”。
-3. 右键“立体声混音” → 启用，再右键 → 设为默认设备。
-4. 在微信输入法语音设置中把麦克风选为“立体声混音”；若保留“自动检测”，确认它
-   解析到的是立体声混音。
+1. 退出正在运行的桥接。
+2. 从 https://vb-audio.com/Cable/ 下载并安装 VB-CABLE（管理员权限），按提示重启。
+3. 在微信输入法的语音设置中把麦克风选为
+   `CABLE Output (VB-Audio Virtual Cable)`。
+4. 用 `python pc/kfb24_bridge.py --list-audio` 确认 `CABLE Input` 播放端点存在。
 
-电脑没有“立体声混音”端点时，桥接仍会锁存语音快捷键，但微信输入法会使用电脑
-麦克风。USB 不是当前桥接通道（BLE/Wi-Fi）时同样使用电脑麦克风。
+桥接把板载音频写入 `CABLE Input`，微信输入法从 `CABLE Output` 录音，不再使用
+Windows“立体声混音”或电脑麦克风。找不到 `CABLE Input` 时，`voice` 会打印安装说明
+并且不按微信输入法快捷键。USB、BLE、Wi-Fi 三种连接都使用同一路径。
 
 ```powershell
 python pc/kfb24_bridge.py --port COM6 --ble
@@ -140,7 +141,7 @@ USB 或 BLE。
 
 | 界面 | 命令 | 电脑端行为 |
 | --- | --- | --- |
-| 语音输入 | `voice` | USB 时第一次按下开始板载麦克风推流并按住微信输入法语音快捷键，第二次停止；非 USB 时只控制电脑麦克风 |
+| 语音输入 | `voice` | 第一次按下开始推流板载麦克风并按住微信输入法语音快捷键，第二次停止；音频经当前通道进入 VB-CABLE，微信输入法从 `CABLE Output` 识别 |
 | 微信输入法 | `ime` | 激活 WeType TSF 配置，失败时发送 `ime_hotkey` |
 | 微信 | `wechat` | 启动 / 恢复 / 最小化 / 聚焦微信窗口 |
 | Orca | `orca` | 启动 / 恢复 / 最小化 / 聚焦 Orca |
@@ -149,11 +150,12 @@ USB 或 BLE。
 | Chrome | `chrome` | 启动 / 恢复 / 最小化 / 聚焦 Chrome |
 | Edge | `edge` | 启动 / 恢复 / 最小化 / 聚焦 Edge |
 
-`voice` 请先把光标放到目标输入框。USB 桥接时第一次按下会启动板载麦克风推流并
-按住语音快捷键，第二次按下停止推流并松开快捷键；桥接把 PCM 播放到默认输出，
-微信输入法从“立体声混音”取音。若微信输入法使用“启动语音输入”模式，把
-`voice_mode` 设为 `"tap"`。更新电脑端后需安装 `sounddevice`（见
-`pc/requirements.txt`）；没有该模块时桥接只锁存快捷键。
+`voice` 请先把光标放到目标输入框。第一次按下会启动板载麦克风推流并按住语音
+快捷键，第二次按下停止推流并松开快捷键。开发板按 40 ms 一块编码 IMA ADPCM，
+桥接解码、重采样后写入 VB-CABLE 的 `CABLE Input`；微信输入法从 `CABLE Output`
+取音。若微信输入法使用“启动语音输入”模式，把 `voice_mode` 设为 `"tap"`。
+电脑端需要 `sounddevice` 与 `pycaw`（见 `pc/requirements.txt`）；找不到虚拟
+麦克风端点时桥接不会按快捷键。
 
 ## 连接与协议
 
@@ -164,12 +166,13 @@ KFB24 CMD <action> <id>
 KFB24 ACK <id> OK|ERR
 KFB24 HELLO bridge/<version>
 KFB24 STATE <transport> <up|down> <detail>
-KFB24 AUDIO <seq> <crc32> <base64-pcm>   ; USB only, 16 kHz mono s16le
-KFB24 AUDIO END                          ; USB only
+KFB24 AUDIO A <seq> <crc32> <base64-adpcm>  ; 16 kHz mono IMA ADPCM
+KFB24 AUDIO END                             ; stop the stream
 ```
 
-音频帧每 512 个采样（1024 字节）发送一次，`crc32` 校验原始 PCM；桥接丢弃损坏帧。
-BLE NUS 与 Wi-Fi TCP 不承载音频。
+音频每 640 个采样（40 ms，323 字节 ADPCM）发送一块，`crc32` 校验 ADPCM 字节；
+桥接丢弃损坏或长度不符的块。音频跟随当前桥接通道：USB、BLE NUS 或 Wi-Fi TCP
+都可以推流，BLE 发送时按 MTU 分片并由桥接重组。
 
 - **USB**：ESP32-C3 USB-Serial-JTAG，VID:PID `303A:1001`，115200。
 - **Wi-Fi**：开发板作为 TCP 客户端连接电脑的 `8765` 端口；桥接地址和端口在
@@ -193,6 +196,7 @@ Wi-Fi/TCP。
   "voice_hotkey": "ctrl+win",
   "voice_mode": "latch",
   "voice_max_seconds": 60,
+  "virtual_mic": "CABLE Input",
   "trae": "C:\\Users\\me\\AppData\\Local\\Programs\\Trae\\Trae.exe",
   "chrome": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
   "edge": "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"
@@ -247,6 +251,23 @@ idf.py -B build-kfb24 build
   必要时重新生成字体。
 - 本项目基于 FoloToy AI Passport 的 BSP 与工具链，但拥有独立的应用界面与交互，不复用
   上游测试菜单。
+
+## 参考与致谢
+
+本项目建立在下面这些项目和资料之上，也注明了从中学到的具体内容：
+
+- [FoloToy AI Passport](https://github.com/FoloToy/ai-passport)：板级支持包、分区表、
+  构建与发布流程的来源。kfb24 的界面、按键状态机和 PC 协议是独立实现，不复用上游
+  测试菜单。
+- [ESP-IDF](https://github.com/espressif/esp-idf) 5.5 与 [LVGL](https://lvgl.io/)：
+  固件框架、NimBLE、USB Serial/JTAG、Wi-Fi 以及图形库。
+- [VB-CABLE](https://vb-audio.com/Cable/)：把开发板音频送进微信输入法的虚拟声卡；
+  桥接通过 `CABLE Input` 播放，微信输入法从 `CABLE Output` 取音。
+- 微信输入法：电脑端的语音识别与文字输入，桥接只负责推流和按住语音快捷键。
+- [`docs/reference/`](docs/reference/README.md)：上游开发经验与移植实录。语音方案
+  参考 [`shinku-chen/audio-compression-trade-offs.md`](docs/reference/shinku-chen/audio-compression-trade-offs.md)
+  对 IMA-ADPCM、Opus 与 MP3 在 ESP32-C3 上的容量和解码开销测量，最终选择 IMA
+  ADPCM 而不是 Opus 或 MP3。
 
 ## 许可
 
