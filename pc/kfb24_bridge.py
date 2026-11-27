@@ -856,6 +856,7 @@ class VirtualMic:
 
     SOURCE_RATE = 16000
     QUEUE_CHUNKS = 25
+    STOP_JOIN_SECONDS = 1.0
     DEFAULT_NAME = "CABLE Input"
     FALLBACK_NAMES = ("cable input", "vb-audio virtual cable",
                       "voicemeeter input", "virtual audio cable",
@@ -943,16 +944,20 @@ class VirtualMic:
     def start(self) -> bool:
         with self._lifecycle_lock:
             with self._lock:
-                if self._thread and self._thread.is_alive():
+                thread = self._thread
+                if thread is not None and thread.is_alive():
                     if self._accepting:
                         return True
                     self._stop.set()
-                thread = self._thread
-            if thread and thread.is_alive():
-                thread.join(1.0)
+            if thread is not None and thread.is_alive():
+                thread.join(self.STOP_JOIN_SECONDS)
                 if thread.is_alive():
                     log("audio: previous worker did not stop")
                     return False
+            with self._lock:
+                # The worker cleaned up after itself once its thread ended.
+                self._thread = None
+                self._stream = None
             try:
                 import sounddevice as sd
             except ImportError:
@@ -1093,15 +1098,21 @@ class VirtualMic:
                     log(f"audio: streaming failed: {error}")
                     break
         finally:
-            with self._lock:
-                self._accepting = False
-                if self._stream is stream:
-                    self._stream = None
+            # This worker owns `stream` and closes it exactly once. Closing a
+            # PortAudio stream from another thread while `write()` still
+            # blocks in the native call corrupts the heap; that race killed
+            # the bridge with STATUS_HEAP_CORRUPTION on the second voice press.
             try:
                 stream.stop()
                 stream.close()
             except Exception:
                 pass
+            with self._lock:
+                if self._stream is stream:
+                    self._stream = None
+                    self._accepting = False
+                if self._thread is threading.current_thread():
+                    self._thread = None
 
     def stop(self) -> None:
         with self._lifecycle_lock:
@@ -1109,23 +1120,23 @@ class VirtualMic:
                 self._accepting = False
                 self._stop.set()
                 thread = self._thread
-            if thread:
-                thread.join(1.0)
+            if thread is not None and thread.is_alive():
+                thread.join(self.STOP_JOIN_SECONDS)
+                if thread.is_alive():
+                    # The worker is still inside a blocking PortAudio write.
+                    # Leave the stream to its owner; it closes when the write
+                    # returns. Do not touch the native handle from here.
+                    log("audio: worker still writing; its stream closes when "
+                        "the write returns")
+                    return
             with self._lock:
-                stream = self._stream
-                self._stream = None
                 self._thread = None
+                self._stream = None
                 while True:
                     try:
                         self._queue.get_nowait()
                     except queue.Empty:
                         break
-            if stream is not None:
-                try:
-                    stream.stop()
-                    stream.close()
-                except Exception:
-                    pass
 
 
 class Actions:
