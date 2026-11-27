@@ -47,6 +47,11 @@ in the Windows Startup folder, and starts the bridge hidden immediately. Output
 goes to `%LOCALAPPDATA%\kfb24\bridge.log`. The bridge starts at every Windows
 login, so the board no longer needs a manually opened terminal.
 
+The launcher supervises the bridge: an abnormal exit is logged with its code and
+the bridge is restarted after a 5-60 s backoff, so a crash does not leave the
+board offline until the next login. A clean exit ends supervision.
+`pc\uninstall_autostart.cmd` stops both the supervisor and the bridge.
+
 - Start only this session: `pc/start_bridge.cmd`.
 - Remove autostart and stop the bridge: `pc/uninstall_autostart.cmd`.
 - The launcher always passes `--ble`, so a busy USB port or an unplugged cable

@@ -42,6 +42,10 @@ python pc/kfb24_bridge.py --configure --ssid "我的Wi-Fi" --password "密码"
 并立即在后台启动桥接。输出写入 `%LOCALAPPDATA%\kfb24\bridge.log`。以后登录 Windows
 会自动启动，不需要手动打开终端。
 
+启动器会守护桥接进程：异常退出时把退出码写入日志，并按 5–60 秒退避后自动重启，
+因此崩溃不会让板子一直离线到下次登录；正常退出则结束守护。
+`pc\uninstall_autostart.cmd` 会同时停止守护进程和桥接进程。
+
 - 只启动本次会话：`pc\start_bridge.cmd`。
 - 取消自启并停止桥接：`pc\uninstall_autostart.cmd`。
 - 启动器始终传入 `--ble`，因此 USB 被占用或没插线时仍可通过 BLE 控制；传
