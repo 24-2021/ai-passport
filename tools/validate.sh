@@ -133,6 +133,8 @@ run_static_checks() {
         "${test_dir}/test_demo_${demo}_runtime"
     done
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_kfb24_bridge_audio.py
+    PYTHONDONTWRITEBYTECODE=1 python3 tests/test_kfb24_voice.py
+    PYTHONDONTWRITEBYTECODE=1 python3 tests/test_kfb24_assistant.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_battery_profile.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_deep_sleep_contract.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_key_wake_contract.py

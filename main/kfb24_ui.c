@@ -6,6 +6,7 @@
 #include "kfb24_fonts.h"
 #include "kfb24_link.h"
 #include "kfb24_power.h"
+#include "kfb24_wake.h"
 #include "lvgl.h"
 
 #include <stdio.h>
@@ -55,7 +56,7 @@ static lv_obj_t *s_bars[KFB24_ACTION_COUNT];
 static lv_obj_t *s_icons[KFB24_ACTION_COUNT];
 static lv_obj_t *s_names[KFB24_ACTION_COUNT];
 static lv_obj_t *s_about;
-static lv_obj_t *s_about_values[6];
+static lv_obj_t *s_about_values[7];
 static int s_selected;
 static uint32_t s_cmd_id;
 static uint32_t s_pending_id;
@@ -64,6 +65,11 @@ static uint32_t s_pending_ms;
 static uint32_t s_seen_ack;
 static uint32_t s_hint_set;
 static bool s_voice_on;
+static lv_obj_t *s_dialog;
+static lv_obj_t *s_dialog_text;
+static uint32_t s_dialog_until;
+
+static void dialog_close(void);
 
 static lv_obj_t *make_label(lv_obj_t *parent, const char *text,
                             const lv_font_t *font, uint32_t color,
@@ -218,7 +224,9 @@ static void update_about(const kfb24_link_status_t *st, int soc, int mv) {
         snprintf(buf, sizeof(buf), "%s", "--");
     }
     lv_label_set_text(s_about_values[4], buf);
-    lv_label_set_text(s_about_values[5], "kfb24 1.0.3");
+    lv_label_set_text(s_about_values[5],
+                      kfb24_wake_ready() ? "你好小智 · 就绪" : "不可用");
+    lv_label_set_text(s_about_values[6], "kfb24 1.0.5");
 }
 
 static void update_status(void) {
@@ -279,7 +287,7 @@ static void execute_action(int index) {
     }
 
     bool voice = index == 0;
-    if (!voice && s_voice_on) {
+    if (!voice && (s_voice_on || kfb24_audio_is_active())) {
         kfb24_audio_stop();
         s_voice_on = false;
     }
@@ -295,7 +303,7 @@ static void execute_action(int index) {
     s_pending_ms = lv_tick_get();
 
     if (voice) {
-        if (s_voice_on) {
+        if (s_voice_on || kfb24_audio_is_active()) {
             kfb24_audio_stop();
             s_voice_on = false;
             set_hint("录音已停止", COL_ACCENT);
@@ -332,7 +340,7 @@ static void about_close(void) {
     if (!s_about) return;
     lv_obj_delete(s_about);
     s_about = NULL;
-    for (int i = 0; i < 6; i++) s_about_values[i] = NULL;
+    for (int i = 0; i < 7; i++) s_about_values[i] = NULL;
 }
 
 static lv_obj_t *about_row(lv_obj_t *parent, const char *name, int y) {
@@ -346,6 +354,7 @@ static lv_obj_t *about_row(lv_obj_t *parent, const char *name, int y) {
 
 static void about_open(void) {
     if (s_about || !s_home) return;
+    dialog_close();
 
     lv_obj_t *overlay = lv_obj_create(s_home);
     lv_obj_remove_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
@@ -359,7 +368,7 @@ static void about_open(void) {
     lv_obj_set_style_bg_opa(overlay, LV_OPA_COVER, 0);
 
     make_label(overlay, "关于", &kfb24_font_22, COL_TEXT, 16, 14);
-    lv_obj_t *version = make_label(overlay, "kfb24 1.0.3",
+    lv_obj_t *version = make_label(overlay, "kfb24 1.0.5",
                                    &lv_font_montserrat_14, COL_MUTED, 16, 46);
     lv_obj_set_width(version, 208);
     lv_obj_set_style_text_align(version, LV_TEXT_ALIGN_RIGHT, 0);
@@ -375,11 +384,12 @@ static void about_open(void) {
     lv_obj_set_style_pad_all(divider, 0, 0);
 
     s_about_values[0] = about_row(overlay, "连接", 84);
-    s_about_values[1] = about_row(overlay, "BLE", 114);
-    s_about_values[2] = about_row(overlay, "网络", 144);
-    s_about_values[3] = about_row(overlay, "地址", 174);
-    s_about_values[4] = about_row(overlay, "电量", 204);
-    s_about_values[5] = about_row(overlay, "固件", 234);
+    s_about_values[1] = about_row(overlay, "BLE", 112);
+    s_about_values[2] = about_row(overlay, "网络", 140);
+    s_about_values[3] = about_row(overlay, "地址", 168);
+    s_about_values[4] = about_row(overlay, "电量", 196);
+    s_about_values[5] = about_row(overlay, "唤醒", 224);
+    s_about_values[6] = about_row(overlay, "固件", 252);
 
     lv_obj_t *rule = lv_obj_create(overlay);
     lv_obj_remove_flag(rule, LV_OBJ_FLAG_SCROLLABLE);
@@ -400,13 +410,66 @@ static void about_open(void) {
     update_status();
 }
 
+static void dialog_close(void) {
+    if (!s_dialog) return;
+    lv_obj_delete(s_dialog);
+    s_dialog = NULL;
+    s_dialog_text = NULL;
+}
+
+static void dialog_open(void) {
+    if (s_dialog || !s_home) return;
+
+    lv_obj_t *panel = lv_obj_create(s_home);
+    lv_obj_set_pos(panel, 0, 156);
+    lv_obj_set_size(panel, SCREEN_W, 164);
+    lv_obj_set_style_radius(panel, 14, 0);
+    lv_obj_set_style_border_width(panel, 1, 0);
+    lv_obj_set_style_border_color(panel, lv_color_hex(COL_BORDER), 0);
+    lv_obj_set_style_bg_color(panel, lv_color_hex(COL_SURFACE_HI), 0);
+    lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_left(panel, 12, 0);
+    lv_obj_set_style_pad_right(panel, 12, 0);
+    lv_obj_set_style_pad_top(panel, 10, 0);
+    lv_obj_set_style_pad_bottom(panel, 10, 0);
+    lv_obj_set_scroll_dir(panel, LV_DIR_VER);
+
+    lv_obj_t *title = make_label(panel, "小智", &kfb24_reply_16, COL_ACCENT, 0, 0);
+    (void)title;
+    lv_obj_t *body = make_label(panel, "", &kfb24_reply_16, COL_TEXT, 0, 24);
+    lv_obj_set_width(body, SCREEN_W - 32);
+    lv_label_set_long_mode(body, LV_LABEL_LONG_WRAP);
+    s_dialog = panel;
+    s_dialog_text = body;
+}
+
+void kfb24_ui_set_text(const char *utf8) {
+    if (!utf8 || !*utf8) return;
+    if (!bsp_lvgl_lock(500)) return;
+    if (s_home) {
+        dialog_open();
+        if (s_dialog_text) {
+            lv_label_set_text(s_dialog_text, utf8);
+            lv_obj_scroll_to_y(s_dialog, 0, LV_ANIM_OFF);
+            s_dialog_until = lv_tick_get() + 15000;
+        }
+    }
+    bsp_lvgl_unlock();
+}
+
 static void status_tick(lv_timer_t *timer) {
     (void)timer;
+    if (s_dialog && (int32_t)(lv_tick_get() - s_dialog_until) >= 0) {
+        dialog_close();
+    }
     kfb24_link_status_t st;
     kfb24_link_get_status(&st);
     if (s_voice_on && !kfb24_audio_is_active()) {
         s_voice_on = false;
         set_hint("录音已停止", COL_WARNING);
+    } else if (!s_voice_on && kfb24_audio_is_active()) {
+        s_voice_on = true;
+        set_hint("语音唤醒 · 正在聆听", COL_ACCENT);
     }
     if (st.ack_seq != s_seen_ack) {
         s_seen_ack = st.ack_seq;
@@ -493,7 +556,7 @@ static void splash_done(lv_timer_t *timer) {
     lv_obj_set_style_bg_opa(foot_rule, LV_OPA_COVER, 0);
     lv_obj_set_style_pad_all(foot_rule, 0, 0);
 
-    make_label(home, "OK 执行 · 长按 关于", &kfb24_font_14, COL_MUTED, 12, 301);
+    make_label(home, "说「你好小智」唤醒", &kfb24_font_14, COL_MUTED, 12, 301);
     lv_obj_t *by = make_label(home, "by 24", &lv_font_montserrat_14,
                               COL_ACCENT, 188, 301);
     lv_obj_set_width(by, 40);
@@ -532,7 +595,7 @@ static lv_obj_t *make_splash(void) {
     lv_obj_set_style_bg_opa(rule, LV_OPA_COVER, 0);
     lv_obj_set_style_pad_all(rule, 0, 0);
 
-    lv_obj_t *tag = make_label(screen, "PC COMMAND CONSOLE",
+    lv_obj_t *tag = make_label(screen, "VOICE WAKE · PC AI CONTROL",
                                &lv_font_montserrat_14, COL_MUTED, 0, 178);
     lv_obj_set_width(tag, SCREEN_W);
     lv_obj_set_style_text_align(tag, LV_TEXT_ALIGN_CENTER, 0);

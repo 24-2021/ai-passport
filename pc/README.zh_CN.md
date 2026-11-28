@@ -99,7 +99,8 @@ BLE NUS 通道没有应用层认证。范围内任何能连接 `kfb24` 的 BLE c
 
 | 开发板动作 | 电脑端效果 |
 | --- | --- |
-| `voice` | 开发板通过当前通道（USB、BLE 或 Wi-Fi）推流板载麦克风到 VB-CABLE 的 `CABLE Input`，微信输入法从 `CABLE Output` 取音；同时按住微信输入法语音快捷键（默认 `Ctrl+Win`）。再次按下同时停止。使用微信输入法，不再发送 Windows `Win+H`。 |
+| `voice` | 开发板通过当前通道（USB、BLE 或 Wi-Fi）推流板载麦克风。有离线模型时桥接自己转写；否则推流到 VB-CABLE 的 `CABLE Input`，微信输入法从 `CABLE Output` 取音，并按住微信输入法语音快捷键（默认 `Ctrl+Win`）。再次按下同时停止。使用微信输入法，不再发送 Windows `Win+H`。 |
+| `wake` | 开发板听到“你好小智”后免按键开始：有离线模型时桥接转写整句，执行应用指令或把文字输入焦点窗口；否则走微信输入法通路，检测到停顿后发送 `KFB24 CTRL voice_stop` 并回车提交。见[免按键语音](#免按键语音唤醒词)。 |
 | `enter` | 在当前焦点窗口按一次回车，提交识别结果（聊天发送、终端执行、搜索提交）。录音进行中选中它时，桥接先松开语音快捷键并停止推流，再按回车。 |
 | `ime` | 激活微信输入法 TSF 配置（`{86598FB9-…}` / `{607FDF85-…}`，langid `0x0804`）；失败时发送配置的热键。 |
 | `wechat` | 按“启动 / 恢复 / 最小化 / 聚焦”切换微信窗口。 |
@@ -147,14 +148,116 @@ python pc/kfb24_bridge.py --list-audio
 桥接会在 `voice_max_seconds`（默认 60 秒）后自动松开，并在退出时松开，避免开发板
 或桥接失联后 `Ctrl`/`Win` 卡住。识别出的文字仍进入当前焦点输入框。
 
-识别完成后不会自动回车：微信输入法在松开快捷键后才把文字写进输入框，自动按键既
+手动录音完成后不会自动回车：微信输入法在松开快捷键后才把文字写进输入框，自动按键既
 可能抢在文字之前，也可能把没说完的一句提交掉。文字确认无误后选“发送”，由桥接
 按一次回车；不打算发送就保持不动。板子上键/下键只移动列表选择，在第一项按上键
-停在原地，不会跳到列表末尾。
+停在原地，不会跳到列表末尾。免按键录音是例外：听到说话后会自动回车，见下节。
 
 启动器按可执行文件名匹配顶层窗口：没有窗口就启动；已最小化就恢复并聚焦；已在前台
 就最小化；其他情况聚焦。若找到窗口但无法聚焦，桥接会报告失败，而不是再启动一个
 重复进程。
+
+## 免按键语音（唤醒词）
+
+烧录带 `model` 分区的固件后，开发板在本地运行 WakeNet9s，听到“你好小智”前不推流。
+识别到唤醒词且桥接连通时，板端发送 `KFB24 CMD wake <id>`。桥接默认用本地
+SenseVoice 模型自己识别这句话；没有安装模型时才退回微信输入法通路。与手动录音
+不同，桥接会计算每个 40 ms 解码块的 RMS：说话累计达到 `wake_min_speech_ms` 后，
+出现 `wake_silence_ms` 的停顿就结束这句。桥接发送 `KFB24 CTRL voice_stop <id>`，
+让板端停止采集，然后转写录音或松开微信输入法快捷键。`wake_no_speech_ms` 内没有
+检测到说话则不执行动作直接结束；`wake_max_seconds` 限制整段会话。会话结束后的
+1.2 秒内板端忽略新的唤醒词。
+
+ESP32-C3 没有回声消除：聆听时不要通过开发板播放声音，否则板端自己的输出会被转写。
+唤醒检测需要模型分区和约 130 KB 空闲堆；缺少任一项时板端记录 `wake: unavailable`，
+按键流程仍然可用。`wake_vad_threshold` 是判定说话的 int16 RMS 门槛：环境嘈杂时
+调高，说话较轻、一直不触发结束时调低。
+
+| 键 | 默认值 | 含义 |
+| --- | --- | --- |
+| `wake_silence_ms` | 900 | 说话后判定结束的停顿 |
+| `wake_min_speech_ms` | 250 | 停顿生效前所需的说话时长 |
+| `wake_no_speech_ms` | 6000 | 一直没有说话时放弃 |
+| `wake_vad_threshold` | 300 | 判定为说话的 RMS |
+| `wake_max_seconds` | 25 | 整段会话上限，`0` 关闭 |
+| `wake_auto_enter` | true | 说完后自动回车 |
+| `wake_enter_delay_ms` | 700 | 微信输入法模式下松开快捷键到回车的间隔 |
+
+## 离线识别与应用指令
+
+安装 `sherpa-onnx` 和 SenseVoice 模型后，免按键语音不再依赖微信输入法和
+VB-CABLE，桥接还能按内容执行指令，而不只是把文字打进去。Windows、Python 3.9+
+只需安装一次：
+
+```powershell
+python -m pip install sherpa-onnx
+mkdir "%LOCALAPPDATA%\kfb24\models" -Force
+curl -L -o "%LOCALAPPDATA%\kfb24\models\sensevoice.tar.bz2" `
+  https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2
+tar -xjf "%LOCALAPPDATA%\kfb24\models\sensevoice.tar.bz2" -C "%LOCALAPPDATA%\kfb24\models"
+```
+
+桥接自动查找解压出的 `sherpa-onnx-sense-voice-*` 目录，也可用 `asr_model_dir`
+指定。启动时后台加载 `model.int8.onnx`（约 240 MB）。停顿后识别耗时几百毫秒，
+然后二选一：匹配到指令就执行；否则用 `SendInput` 把文字直接输入当前焦点窗口
+（不占用剪贴板，也不需要微信输入法）。指令按整句精确匹配，含关键词的听写不会被
+误执行：
+
+- `<打开动词> <应用>` 或只说应用名：打开或切换已配置的应用。应用别名覆盖微信、
+  Trae、Chrome（浏览器）、Edge、终端、Orca；打开动词包括“打开、启动、运行、
+  切换到、切到、进入、回到”。
+- “回车、按回车、确认、发送、提交”：按一次回车。
+- `voice_commands` 可把整句映射到任意动作：`enter`、`ime`、`voice`、`wake`、
+  `wechat`、`orca`、`terminal`、`trae`、`chrome`、`edge`。
+- 其余整句作为听写输入；`voice_dictation` 设为 `false` 可只执行指令。
+
+没有模型，或 `voice_backend` 设为 `wetype` 时，桥接保持旧行为：VB-CABLE 加
+微信输入法快捷键，并可自动回车。`voice_backend` 支持 `auto`（默认，有模型时
+离线）、`sherpa`、`wetype`。
+
+| 键 | 默认值 | 含义 |
+| --- | --- | --- |
+| `voice_backend` | `auto` | `auto`、`sherpa` 或 `wetype` |
+| `asr_model_dir` | 空 | 显式指定 SenseVoice 模型目录 |
+| `asr_threads` | 2 | ONNX 推理线程数 |
+| `voice_commands` | `{}` | 整句到动作的映射 |
+| `voice_dictation` | true | 非指令整句是否输入到焦点窗口 |
+
+## 与小智对话
+
+离线识别可用时，唤醒词听到、又不匹配应用指令语法的句子会交给本地模型，而不是
+直接输入到焦点窗口。开发板显示“小智正在思考…”面板，桥接把识别文本发给 Ollama
+（或任何 OpenAI 兼容服务），答案通过开发板扬声器播报，同时显示在底部对话框。
+手动 `voice` 动作仍然只做听写，只有唤醒词进入对话。
+
+默认后端是 `http://127.0.0.1:11434` 的 Ollama。`llm_model` 为空时桥接选择第一个
+已安装模型并记录名称。对话对延迟敏感，因此关闭思考模式；已加载的 2B 模型约一秒
+回答。回复限制在两句话左右，去掉 markdown 和表情符号；`tts_voice` 选择 Windows
+SAPI 语音（空为系统默认）。语音按 16 kHz 单声道合成，再用与上行相同的 IMA ADPCM
+格式推给开发板：固件用 `KFB24 TEXT <base64>` 显示文字，用 `KFB24 AUDIO P` 播放。
+
+模型可以调用 `open_app`、`type_text`、`press_enter` 和 `dispatch_agent`。
+`dispatch_agent` 在 `agent_workdir` 里运行 CLI 编程 agent（默认 `pi`，可配置
+`claude`），最多等待 `agent_timeout` 秒，再把结果总结成两句话。命令是 argv 列表，
+`{prompt}` 直接替换，不经过 shell。精确的应用指令语法优先执行，所以“打开…”
+不会等模型。服务不可达时桥接记录 `assistant: local model unavailable`，退回听写，
+30 秒后重试。
+
+| 键 | 默认 | 含义 |
+| --- | --- | --- |
+| `assistant_enabled` | true | 未匹配的唤醒语句交给模型 |
+| `llm_api` | `ollama` | `ollama`（原生接口，关闭思考）或 `openai` |
+| `llm_url` | `http://127.0.0.1:11434` | 服务地址 |
+| `llm_model` | 空 | 模型名；空则选择第一个已安装模型 |
+| `llm_timeout` | 90 | 单次对话超时（秒） |
+| `agent_commands` | `pi`、`claude` | 名称到 argv 模板的映射 |
+| `agent_workdir` | 空 | CLI agent 工作目录；空则用桥接当前目录 |
+| `agent_timeout` | 600 | CLI agent 超时（秒） |
+| `tts_voice` | 空 | SAPI 语音名；空则用系统默认 |
+| `tts_rate` | 0 | SAPI 语速，-10 到 10 |
+
+默认调度 `pi`：本机的 Claude Code 指向一个拒绝所有模型名的代理，换用可用的 CLI
+时只需改 `agent_commands`，不用改代码。
 
 ## 覆盖配置
 
@@ -171,6 +274,28 @@ python pc/kfb24_bridge.py --list-audio
   "voice_hotkey": "ctrl+win",
   "voice_mode": "latch",
   "voice_max_seconds": 60,
+  "wake_silence_ms": 900,
+  "wake_min_speech_ms": 250,
+  "wake_no_speech_ms": 6000,
+  "wake_vad_threshold": 300,
+  "wake_auto_enter": true,
+  "wake_enter_delay_ms": 700,
+  "wake_max_seconds": 25,
+  "voice_backend": "auto",
+  "asr_model_dir": "",
+  "asr_threads": 2,
+  "voice_commands": {"开始写代码": "trae"},
+  "voice_dictation": true,
+  "assistant_enabled": true,
+  "llm_api": "ollama",
+  "llm_url": "http://127.0.0.1:11434",
+  "llm_model": "",
+  "llm_timeout": 90,
+  "agent_commands": {"pi": ["pi", "-p", "--no-session", "{prompt}"]},
+  "agent_workdir": "",
+  "agent_timeout": 600,
+  "tts_voice": "",
+  "tts_rate": 0,
   "virtual_mic": "CABLE Input",
   "ime_hotkey": "ctrl+space"
 }
@@ -186,7 +311,7 @@ python pc/kfb24_bridge.py --list-audio
 配置相同的快捷键。
 
 用 `--config PATH` 指定其他文件；`--dry-run` 只打印动作，不发送输入或启动程序；
-`--test-action voice|ime|wechat|orca|terminal|trae|chrome|edge` 单独测试一个动作；
+`--test-action voice|wake|ime|wechat|orca|terminal|trae|chrome|edge` 单独测试一个动作；
 `--verbose` 打印开发板日志和所有协议帧。
 
 ## 排查

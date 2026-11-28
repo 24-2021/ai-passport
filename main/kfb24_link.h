@@ -25,6 +25,10 @@ typedef struct {
 
 void kfb24_link_start(const kfb24_cfg_t *cfg);
 
+// The bridge sends CTRL voice_stop when it detects end of speech. The handler
+// runs in the link task and must only flip state, never block on LVGL.
+void kfb24_link_set_voice_stop_handler(void (*handler)(void));
+
 // Queues one action for the link task. Returns false when no transport is up or
 // the queue is full. Never blocks the LVGL task.
 bool kfb24_link_send_cmd(const char *name, uint32_t id);

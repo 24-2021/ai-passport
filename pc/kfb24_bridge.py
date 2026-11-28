@@ -38,6 +38,10 @@ from ctypes import wintypes
 from pathlib import Path
 from typing import Callable, Optional
 
+from kfb24_agent import APP_NAMES, Agent
+from kfb24_speech import synthesize
+from kfb24_voice import Recognizer, match_intent, resolve_model_dir, type_text
+
 try:
     import serial
     from serial.tools import list_ports
@@ -51,7 +55,7 @@ except ImportError:  # pragma: no cover - reported by main when --ble is used
     BleakClient = None
     BleakScanner = None
 
-VERSION = "1.0.3"
+VERSION = "1.2.0"
 PREFIX = "KFB24 "
 DEFAULT_TCP_PORT = 8765
 DEFAULT_CONFIG = Path(os.environ.get("APPDATA", str(Path.home()))) / "kfb24" / "bridge.json"
@@ -112,6 +116,57 @@ def adpcm_decode(data: bytes) -> Optional[bytes]:
         index = min(88, max(0, index + _ADPCM_INDEX[code]))
         pcm.append(predictor)
     return pcm.tobytes()
+
+
+def adpcm_encode(pcm: bytes, state: dict) -> bytes:
+    """Encode one 640-sample block; ``state["index"]`` carries across blocks.
+
+    Mirrors main/kfb24_adpcm.c, including the persistent step index, so the
+    firmware decodes the stream with the same predictor history.
+    """
+    if len(pcm) != ADPCM_SAMPLES * 2:
+        raise ValueError("adpcm block must be 1280 bytes")
+    samples = struct.unpack("<%dh" % ADPCM_SAMPLES, pcm)
+    index = int(state.get("index", 0))
+    if index > 88:
+        index = 0
+    predictor = samples[0]
+    out = bytearray(ADPCM_BYTES)
+    out[0] = predictor & 0xFF
+    out[1] = (predictor >> 8) & 0xFF
+    out[2] = index
+    nibble = 3
+    for i in range(1, ADPCM_SAMPLES):
+        step = _ADPCM_STEP[index]
+        diff = samples[i] - predictor
+        code = 0
+        if diff < 0:
+            code = 8
+            diff = -diff
+        delta = step >> 3
+        if diff >= step:
+            code |= 4
+            diff -= step
+            delta += step
+        step >>= 1
+        if diff >= step:
+            code |= 2
+            diff -= step
+            delta += step
+        step >>= 1
+        if diff >= step:
+            code |= 1
+            delta += step
+        predictor += -delta if code & 8 else delta
+        predictor = max(-32768, min(32767, predictor))
+        index = max(0, min(88, index + _ADPCM_INDEX[code]))
+        if i & 1:
+            out[nibble] = code << 4
+        else:
+            out[nibble] |= code
+            nibble += 1
+    state["index"] = index
+    return bytes(out)
 
 
 def log(message: str) -> None:
@@ -636,6 +691,31 @@ DEFAULT_CONFIG_VALUES = {
     "voice_hotkey": "ctrl+win",
     "voice_mode": "latch",
     "voice_max_seconds": 60,
+    "wake_silence_ms": 900,
+    "wake_min_speech_ms": 250,
+    "wake_no_speech_ms": 6000,
+    "wake_vad_threshold": 300,
+    "wake_auto_enter": True,
+    "wake_enter_delay_ms": 700,
+    "wake_max_seconds": 25,
+    "voice_backend": "auto",
+    "asr_model_dir": "",
+    "asr_threads": 2,
+    "voice_commands": {},
+    "voice_dictation": True,
+    "assistant_enabled": True,
+    "llm_api": "ollama",
+    "llm_url": "http://127.0.0.1:11434",
+    "llm_model": "",
+    "llm_timeout": 90,
+    "agent_commands": {
+        "pi": ["pi", "-p", "--no-session", "{prompt}"],
+        "claude": ["claude", "-p", "{prompt}"],
+    },
+    "agent_workdir": "",
+    "agent_timeout": 600,
+    "tts_voice": "",
+    "tts_rate": 0,
     "virtual_mic": "CABLE Input",
     "ime_clsid": "{86598FB9-66A2-463E-B9C2-AEB906D477AD}",
     "ime_profile": "{607FDF85-FCC8-4DBD-A365-41296F980C9C}",
@@ -662,6 +742,80 @@ def voice_max_seconds(config: dict) -> float:
     except (TypeError, ValueError):
         seconds = 60.0
     return max(0.0, min(seconds, 3600.0))
+
+
+def _config_number(config: dict, key: str, default: float,
+                   low: float, high: float) -> float:
+    try:
+        value = float(config.get(key, default))
+    except (TypeError, ValueError):
+        value = default
+    return max(low, min(value, high))
+
+
+class SpeechEndDetector:
+    """Decide when a hands-free utterance is over.
+
+    The board streams 640-sample (40 ms) ADPCM blocks. Speech is "loud" blocks
+    (RMS above the configured threshold); once the user has spoken for
+    ``wake_min_speech_ms``, ``wake_silence_ms`` of consecutive quiet blocks ends
+    the session. Waiting for loud speech first avoids ending a session because
+    the user paused before starting. Without any speech for
+    ``wake_no_speech_ms`` the detector gives up, so a stray wake word cannot
+    leave the microphone open indefinitely.
+
+    This is not a wake-word detector and not a substitute for an AEC: it only
+    runs while a session is already active.
+    """
+
+    def __init__(self, config: dict) -> None:
+        self.threshold = _config_number(config, "wake_vad_threshold", 300,
+                                        1, 32767)
+        self.min_speech_ms = _config_number(config, "wake_min_speech_ms", 250,
+                                            0, 10000)
+        self.silence_ms = _config_number(config, "wake_silence_ms", 900,
+                                         100, 10000)
+        self.no_speech_ms = _config_number(config, "wake_no_speech_ms", 6000,
+                                           500, 60000)
+        self.reset()
+
+    def reset(self) -> None:
+        self.elapsed_ms = 0.0
+        self.speech_ms = 0.0
+        self.quiet_ms = 0.0
+        self.heard_speech = False
+        self.done = False
+
+    @staticmethod
+    def rms(pcm: bytes) -> float:
+        samples = struct.unpack("<%dh" % (len(pcm) // 2), pcm)
+        if not samples:
+            return 0.0
+        return (sum(sample * sample for sample in samples) /
+                len(samples)) ** 0.5
+
+    def feed(self, pcm: bytes) -> Optional[str]:
+        """Return 'silence', 'no_speech', or None while the session continues."""
+        if self.done or not pcm:
+            return None
+        frame_ms = len(pcm) / (2 * 16000) * 1000.0
+        self.elapsed_ms += frame_ms
+        if self.rms(pcm) >= self.threshold:
+            self.speech_ms += frame_ms
+            if self.speech_ms >= self.min_speech_ms:
+                self.heard_speech = True
+            self.quiet_ms = 0.0
+            return None
+        if not self.heard_speech:
+            if self.elapsed_ms >= self.no_speech_ms:
+                self.done = True
+                return "no_speech"
+            return None
+        self.quiet_ms += frame_ms
+        if self.quiet_ms >= self.silence_ms:
+            self.done = True
+            return "silence"
+        return None
 
 
 class AudioGuard:
@@ -1149,8 +1303,67 @@ class Actions:
         self._voice_keys: list[tuple[int, bool]] = []
         self._voice_timer: Optional[threading.Timer] = None
         self._voice_max_seconds = voice_max_seconds(config)
+        self._wake: Optional[SpeechEndDetector] = None
+        self._wake_tap = False
+        self._hands_free = False
+        self._enter_timer: Optional[threading.Timer] = None
+        self.stop_capture: Optional[Callable[[], None]] = None
+        self._local_backend: Optional[bool] = None
+        self._wake_pcm = bytearray()
+        self._asr: Optional[Recognizer] = None
+        self._asr_lock = threading.Lock()
+        self.say: Optional[Callable[[str], None]] = None
+        self.show_text: Optional[Callable[[str], None]] = None
+        self.agent: Optional[Agent] = None
+        self._wake_assistant = False
         if not dry_run:
             atexit.register(self.close)
+
+    def local_voice(self) -> bool:
+        """True when the bridge recognises speech itself instead of WeType."""
+        if self._local_backend is not None:
+            return self._local_backend
+        backend = str(self.config.get("voice_backend", "auto")).strip().lower()
+        model = resolve_model_dir(str(self.config.get("asr_model_dir", "")))
+        if backend in ("wetype", "ime", "typing"):
+            self._local_backend = False
+            log("voice: backend WeType")
+        elif backend in ("sherpa", "local", "offline"):
+            if model is None:
+                log("voice: offline ASR requested but no model found; "
+                    "falling back to WeType")
+                self._local_backend = False
+            else:
+                self._local_backend = True
+                log(f"voice: backend offline ASR ({model.name})")
+        else:
+            self._local_backend = model is not None
+            log("voice: backend "
+                + (f"offline ASR ({model.name})" if model is not None
+                   else "WeType (install a SenseVoice model for offline ASR)"))
+        return self._local_backend
+
+    def _ensure_asr(self) -> Optional[Recognizer]:
+        with self._asr_lock:
+            if self._asr is not None:
+                return self._asr
+            model = resolve_model_dir(str(self.config.get("asr_model_dir", "")))
+            if model is None:
+                self._local_backend = False
+                return None
+            try:
+                self._asr = Recognizer(
+                    model, int(self.config.get("asr_threads", 2)))
+            except Exception as error:
+                log(f"voice: offline ASR failed to load ({error}); using WeType")
+                self._local_backend = False
+                return None
+            log("voice: offline ASR model loaded")
+            return self._asr
+
+    def warm_asr(self) -> None:
+        if self.local_voice():
+            threading.Thread(target=self._ensure_asr, daemon=True).start()
 
     def launch(self, name: str) -> bool:
         path = str(self.config.get(name, ""))
@@ -1258,14 +1471,32 @@ class Actions:
         self.audio.stop()
         self.guard.restore()
 
+    def _cancel_enter_locked(self) -> None:
+        timer = self._enter_timer
+        self._enter_timer = None
+        if timer is not None:
+            timer.cancel()
+
     def _release_voice_locked(self, reason: str) -> bool:
         timer = self._voice_timer
         self._voice_timer = None
         if timer is not None:
             timer.cancel()
+        self._cancel_enter_locked()
+        had_wake = self._wake is not None
+        self._wake = None
+        self._wake_pcm = bytearray()
+        self._hands_free = False
+        self._wake_tap = False
         keys = self._voice_keys
         self._voice_keys = []
+        if had_wake:
+            callback = self.stop_capture
+            if callback is not None:
+                callback()
         if not keys:
+            if had_wake:
+                self._stop_audio()
             return True
         ok = release_keys(keys)
         self._stop_audio()
@@ -1290,10 +1521,34 @@ class Actions:
             self._voice_timer = None
             if timer is not None:
                 timer.cancel()
+            self._cancel_enter_locked()
+            local = self.local_voice()
+            detector = self._wake
+            heard = detector.heard_speech if detector is not None else False
+            pcm = bytes(self._wake_pcm) if local else b""
+            self._wake_pcm = bytearray()
+            had_wake = detector is not None
+            tap = self._wake_tap
+            assistant = self._wake_assistant
+            self._wake = None
+            self._hands_free = False
+            self._wake_tap = False
             keys = self._voice_keys
             self._voice_keys = []
             self._stop_audio()
+        if local:
+            if heard and pcm:
+                self._submit_asr(pcm, assistant)
+            elif had_wake:
+                log("wake: board ended the capture session")
+            return
+        if tap:
+            hotkey = str(self.config.get("voice_hotkey", "")).strip()
+            if hotkey:
+                send_hotkey(hotkey)
         if not keys:
+            if had_wake:
+                log("wake: board ended the capture session")
             return
         if release_keys(keys):
             log("voice: board ended the capture session")
@@ -1309,7 +1564,7 @@ class Actions:
         on silence and the next voice press toggles it off instead of on.
         """
         with self._voice_lock:
-            if self._voice_keys:
+            if self._voice_keys or self._wake is not None:
                 self._release_voice_locked(reason)
             else:
                 self._stop_audio()
@@ -1328,6 +1583,11 @@ class Actions:
     def voice(self) -> bool:
         """Latch the configured key for hold-to-talk, or tap it in tap mode."""
         hotkey = str(self.config.get("voice_hotkey", "ctrl+win")).strip()
+        if self.local_voice():
+            with self._voice_lock:
+                if self._wake is not None:
+                    return self.finish_wake("stopped")
+                return self._wake_local(False)
         if self.dry_run:
             log(f"dry-run: send WeType voice hotkey {hotkey or '<disabled>'}")
             return True
@@ -1377,7 +1637,237 @@ class Actions:
                 log("voice: recording; press voice again to stop")
             return True
 
+    def _wake_local(self, assistant: bool = True) -> bool:
+        """Start a hands-free session recognised by the bridge itself."""
+        with self._voice_lock:
+            self._cancel_enter_locked()
+            if self._wake is not None:
+                self._wake = SpeechEndDetector(self.config)
+                self._wake_assistant = assistant
+                log("wake: still listening; speech timer restarted")
+                return True
+            self._wake_pcm = bytearray()
+            self._wake_assistant = assistant
+            detector = SpeechEndDetector(self.config)
+            self._wake = detector
+            self._wake_tap = False
+            self._hands_free = True
+            max_seconds = _config_number(self.config, "wake_max_seconds",
+                                         25, 0, 3600)
+            if max_seconds > 0:
+                timer = threading.Timer(max_seconds, self._wake_timeout)
+                timer.daemon = True
+                timer.start()
+                self._voice_timer = timer
+            log("wake: listening (offline ASR); auto-stop after "
+                f"{detector.silence_ms:g} ms of silence"
+                + (f" (cap {max_seconds:g}s)" if max_seconds > 0 else ""))
+            return True
+
+    def wake(self) -> bool:
+        """Start a hands-free voice session after the board heard the wake word.
+
+        With a local ASR model the bridge records the utterance and routes it
+        itself; otherwise it uses the WeType hotkey and lets the bridge press
+        Enter after the pause.
+        """
+        hotkey = str(self.config.get("voice_hotkey", "ctrl+win")).strip()
+        if self.local_voice():
+            return self._wake_local()
+        if self.dry_run:
+            log("dry-run: wake word session "
+                f"(hotkey={hotkey or '<disabled>'})")
+            return True
+        if not hotkey:
+            log("wake: voice_hotkey is disabled")
+            return False
+
+        mode = str(self.config.get("voice_mode", "latch")).strip().lower()
+        tap = mode in ("tap", "toggle", "once")
+        if not tap and mode not in ("latch", "hold", ""):
+            log(f"wake: unknown voice_mode {mode!r}; use latch or tap")
+            return False
+        keys = None if tap else hotkey_keys(hotkey)
+        if not tap and not keys:
+            return False
+
+        with self._voice_lock:
+            self._cancel_enter_locked()
+            if self._wake is not None:
+                # A second wake while listening keeps the stream open and only
+                # restarts the speech timer; toggling WeType here would stop it.
+                self._wake = SpeechEndDetector(self.config)
+                log("wake: still listening; speech timer restarted")
+                return True
+            if not self._start_audio():
+                return False
+            if tap:
+                ok = (send_right_alt_hold()
+                      if hotkey.lower() in ("right-alt", "right_alt", "ralt")
+                      else send_hotkey(hotkey))
+                if not ok:
+                    self._stop_audio()
+                    log("wake: could not tap the hotkey")
+                    return False
+            elif not press_keys(keys):
+                release_keys(keys)
+                self._stop_audio()
+                log("wake: could not press hotkey")
+                return False
+            else:
+                self._voice_keys = keys
+
+            detector = SpeechEndDetector(self.config)
+            self._wake = detector
+            self._wake_tap = tap
+            self._hands_free = True
+            max_seconds = _config_number(self.config, "wake_max_seconds",
+                                         25, 0, 3600)
+            if max_seconds > 0:
+                timer = threading.Timer(max_seconds, self._wake_timeout)
+                timer.daemon = True
+                timer.start()
+                self._voice_timer = timer
+            log(f"wake: listening; auto-stop after "
+                f"{detector.silence_ms:g} ms of silence"
+                + (f" (cap {max_seconds:g}s)" if max_seconds > 0 else ""))
+            return True
+
+    def audio_block(self, pcm: bytes) -> Optional[str]:
+        """Feed one decoded block to the hands-free detector, if any."""
+        local = self.local_voice()
+        with self._voice_lock:
+            detector = self._wake
+            if detector is not None and local:
+                limit = int(_config_number(self.config, "wake_max_seconds",
+                                           25, 0, 3600) * 2 * 16000)
+                if len(self._wake_pcm) < limit:
+                    self._wake_pcm.extend(pcm[: limit - len(self._wake_pcm)])
+        if detector is None:
+            return None
+        return detector.feed(pcm)
+
+    def finish_wake(self, reason: str) -> None:
+        """Close a hands-free session after end of speech, timeout, or error."""
+        local = self.local_voice()
+        with self._voice_lock:
+            detector = self._wake
+            if detector is None:
+                return
+            heard = detector.heard_speech
+            pcm = bytes(self._wake_pcm) if local else b""
+            self._wake_pcm = bytearray()
+            timer = self._voice_timer
+            self._voice_timer = None
+            if timer is not None:
+                timer.cancel()
+            self._cancel_enter_locked()
+            self._wake = None
+            self._hands_free = False
+            tap = self._wake_tap
+            self._wake_tap = False
+            keys = self._voice_keys
+            self._voice_keys = []
+            self._stop_audio()
+        if keys:
+            release_keys(keys)
+        if tap:
+            hotkey = str(self.config.get("voice_hotkey", "")).strip()
+            if hotkey:
+                send_hotkey(hotkey)
+        log(f"wake: {reason}; session closed")
+        if local:
+            if heard and pcm and reason in ("silence", "timeout", "stopped"):
+                self._submit_asr(pcm, self._wake_assistant)
+            return
+        if (heard and reason == "silence" and
+                bool(self.config.get("wake_auto_enter", True))):
+            self._schedule_enter()
+
+    def _submit_asr(self, pcm: bytes, assistant: bool = False) -> None:
+        """Recognise an utterance off the transport thread, then act on it."""
+        def work() -> None:
+            recognizer = self._ensure_asr()
+            if recognizer is None:
+                log("asr: no recogniser available")
+                return
+            try:
+                text = recognizer.transcribe(pcm)
+            except Exception as error:
+                log(f"asr: recognition failed ({error})")
+                return
+            if not text:
+                log("asr: no text recognised")
+                return
+            log(f"asr: {text!r}")
+            commands = self.config.get("voice_commands")
+            if not isinstance(commands, dict):
+                commands = {}
+            intent = match_intent(text, commands)
+            if intent is not None:
+                log(f"voice command: {intent.action}")
+                self.run(intent.action)
+                if assistant and self.say and intent.action in APP_NAMES:
+                    self.say(f"好的，已打开{APP_NAMES[intent.action]}")
+                return
+            if assistant and not self.dry_run and self.agent is not None:
+                reply = self.agent.respond(text)
+                if reply:
+                    log(f"assistant: {reply!r}")
+                    if self.say:
+                        self.say(reply)
+                    return
+                log("assistant: unavailable; falling back to dictation")
+            if not bool(self.config.get("voice_dictation", True)):
+                log("asr: ignored (voice_dictation is off)")
+                return
+            if self.dry_run:
+                log(f"dry-run: type {text!r}")
+                return
+            if not type_text(text):
+                log("asr: typing failed")
+                return
+            log("asr: typed into the focused window")
+            if bool(self.config.get("wake_auto_enter", True)):
+                if self.enter():
+                    log("wake: submitted")
+                else:
+                    log("wake: Enter failed")
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _schedule_enter(self) -> None:
+        delay = _config_number(self.config, "wake_enter_delay_ms",
+                               700, 0, 10000) / 1000.0
+        with self._voice_lock:
+            self._cancel_enter_locked()
+            timer = threading.Timer(delay, self._auto_enter)
+            timer.daemon = True
+            timer.start()
+            self._enter_timer = timer
+        log(f"wake: will submit in {delay:g}s")
+
+    def _auto_enter(self) -> None:
+        with self._voice_lock:
+            self._enter_timer = None
+            busy = (self._wake is not None or self._hands_free or
+                    bool(self._voice_keys))
+        if busy:
+            return
+        if self.enter():
+            log("wake: submitted")
+        else:
+            log("wake: Enter failed")
+
+    def _wake_timeout(self) -> None:
+        callback = self.stop_capture
+        if callback is not None:
+            callback()
+        self.finish_wake("timeout")
+
     def run(self, name: str) -> bool:
+        if name == "wake":
+            return self.wake()
         if name == "voice":
             return self.voice()
         if name == "enter":
@@ -1433,6 +1923,18 @@ class SerialTransport:
         self._thread = threading.Thread(target=self._read_loop, daemon=True)
         self._thread.start()
 
+    @property
+    def alive(self) -> bool:
+        return self._running and bool(self.ser.is_open)
+
+    def _lost(self, error: Exception) -> None:
+        log(f"serial: {self.port} lost ({error}); reopening")
+        self._running = False
+        try:
+            self.ser.close()
+        except (OSError, serial.SerialException):
+            pass
+
     def _read_loop(self) -> None:
         buffer = ""
         while self._running:
@@ -1440,7 +1942,7 @@ class SerialTransport:
                 raw = self.ser.read(4096)
             except (OSError, serial.SerialException) as error:
                 if self._running:
-                    log(f"serial: read failed: {error}")
+                    self._lost(error)
                 break
             if not raw:
                 continue
@@ -1454,7 +1956,7 @@ class SerialTransport:
                 buffer = ""
 
     def send(self, line: str) -> bool:
-        if not self.ser.is_open:
+        if not self.alive:
             return False
         try:
             with self._write_lock:
@@ -1462,7 +1964,7 @@ class SerialTransport:
                 self.ser.flush()
             return True
         except (OSError, serial.SerialException) as error:
-            log(f"serial: write failed: {error}")
+            self._lost(error)
             return False
 
     def label(self) -> str:
@@ -1602,14 +2104,21 @@ class BleTransport:
         client = self._client
         if loop is None or client is None:
             return False
-        future = asyncio.run_coroutine_threadsafe(
-            client.write_gatt_char(BLE_RX_UUID,
-                                   (line + "\n").encode("utf-8"),
-                                   response=False),
-            loop,
-        )
+        payload = (line + "\n").encode("utf-8")
         try:
-            future.result(timeout=3.0)
+            mtu = int(getattr(client, "mtu_size", 23) or 23)
+        except (TypeError, ValueError):
+            mtu = 23
+        chunk = max(20, mtu - 3)
+        try:
+            for offset in range(0, len(payload), chunk):
+                future = asyncio.run_coroutine_threadsafe(
+                    client.write_gatt_char(BLE_RX_UUID,
+                                           payload[offset:offset + chunk],
+                                           response=False),
+                    loop,
+                )
+                future.result(timeout=3.0)
             return True
         except Exception as error:
             if self.verbose:
@@ -1650,6 +2159,13 @@ class Bridge:
         self._enable_tcp = enable_tcp
         self._audio_drops = 0
         self._rx_blocks = 0
+        self._speak_lock = threading.Lock()
+        self._audio_seq = 0
+        self._ctrl_id = 0
+        self._serial_port = serial_port
+        self._serial_retry_at = 0.0
+        self._serial_notice_at = 0.0
+        actions.stop_capture = self._stop_capture
         if serial_port:
             if serial is None:
                 if not enable_ble:
@@ -1743,6 +2259,10 @@ class Bridge:
                 self.tcp = None
                 log(f"tcp: board disconnected {transport.peer[0]}:{transport.peer[1]}")
 
+    def _stop_capture(self) -> None:
+        self._ctrl_id += 1
+        self.send_all(f"KFB24 CTRL voice_stop {self._ctrl_id}")
+
     def send_line(self, transport, line: str) -> bool:
         ok = transport.send(line)
         if self.verbose:
@@ -1750,7 +2270,7 @@ class Bridge:
         return ok
 
     def send_all(self, line: str) -> None:
-        if self.serial:
+        if self.serial and self.serial.alive:
             self.send_line(self.serial, line)
         with self.tcp_lock:
             tcp = self.tcp
@@ -1758,6 +2278,63 @@ class Bridge:
             self.send_line(tcp, line)
         if self.ble:
             self.send_line(self.ble, line)
+
+    def show_text(self, text: str) -> None:
+        """Put a line on the board dialog, truncated at a UTF-8 boundary."""
+        raw = (text or "").strip().encode("utf-8")
+        if not raw:
+            return
+        raw = raw[:300].decode("utf-8", errors="ignore").encode("utf-8")
+        try:
+            self.send_all("KFB24 TEXT " + base64.b64encode(raw).decode("ascii"))
+        except Exception as error:
+            log(f"text: send failed ({error})")
+
+    def say(self, text: str) -> None:
+        """Speak ``text`` on the board in the background."""
+        text = (text or "").strip()
+        if not text:
+            return
+        threading.Thread(target=self._speak_worker, args=(text,),
+                         daemon=True).start()
+
+    def _speak_worker(self, text: str) -> None:
+        with self._speak_lock:
+            self.show_text(text)
+            config = self.actions.config
+            voice = str(config.get("tts_voice", "")).strip()
+            try:
+                rate = int(config.get("tts_rate", 0))
+            except (TypeError, ValueError):
+                rate = 0
+            started = time.monotonic()
+            pcm = synthesize(text, voice=voice, rate=rate)
+            if not pcm:
+                log("tts: no audio produced")
+                return
+            log(f"tts: {len(pcm) // 32} ms of speech in "
+                f"{time.monotonic() - started:.1f}s")
+            block_bytes = ADPCM_SAMPLES * 2
+            if len(pcm) % block_bytes:
+                pcm += bytes(block_bytes - len(pcm) % block_bytes)
+            # A short tail keeps the codec from clicking when playback stops.
+            pcm += bytes(block_bytes)
+            state = {"index": 0}
+            blocks = len(pcm) // block_bytes
+            begin = time.monotonic()
+            for index in range(blocks):
+                block = adpcm_encode(pcm[index * block_bytes:
+                                          (index + 1) * block_bytes], state)
+                crc = zlib.crc32(block) & 0xFFFFFFFF
+                payload = base64.b64encode(block).decode("ascii")
+                self.send_all(f"KFB24 AUDIO P {self._audio_seq} "
+                              f"{crc:08x} {payload}")
+                self._audio_seq = (self._audio_seq + 1) & 0xFFFFFFFF
+                due = begin + max(0, index - 2) * 0.040
+                delay = due - time.monotonic()
+                if delay > 0:
+                    time.sleep(delay)
+            log(f"tts: sent {blocks} blocks")
 
     def _on_audio_line(self, line: str, transport) -> None:
         parts = line.strip().split()
@@ -1790,7 +2367,12 @@ class Bridge:
             peak = max(abs(v) for v in
                        struct.unpack("<%dh" % (len(pcm) // 2), pcm))
             log(f"audio: rx #{self._rx_blocks} peak={peak}")
-        self.actions.audio.write(pcm)
+        if not self.actions.local_voice():
+            self.actions.audio.write(pcm)
+        reason = self.actions.audio_block(pcm)
+        if reason:
+            self._stop_capture()
+            self.actions.finish_wake(reason)
 
     def _drop_audio(self, reason: str) -> None:
         self._audio_drops += 1
@@ -1829,9 +2411,44 @@ class Bridge:
             self.send_line(transport, f"KFB24 ACK {frame['id']} "
                                       f"{'OK' if ok else 'ERR'}")
 
+    def _maintain_serial(self) -> None:
+        if serial is None:
+            return
+        current = self.serial
+        if current is not None and current.alive:
+            return
+        if current is not None:
+            current.close()
+            self.serial = None
+        port = self._serial_port or find_serial_port(None)
+        if not port:
+            return
+        now = time.monotonic()
+        if now < self._serial_retry_at:
+            return
+        transport = SerialTransport(port, self.on_line, self.verbose)
+        try:
+            transport.open()
+            transport.start()
+        except Exception as error:
+            transport.close()
+            detected = find_serial_port(None)
+            if detected and detected != port:
+                self._serial_port = detected
+            self._serial_retry_at = now + 5.0
+            if now >= self._serial_notice_at:
+                self._serial_notice_at = now + 60.0
+                log(f"serial: {port} unavailable ({error})")
+            return
+        self.serial = transport
+        self._serial_port = port
+        self._serial_retry_at = 0.0
+        log(f"serial: {port} @ 115200")
+
     def start_heartbeat(self) -> None:
         def beat() -> None:
             while self.running:
+                self._maintain_serial()
                 self.send_all(f"KFB24 HELLO bridge/{VERSION}")
                 time.sleep(2.0)
 
@@ -1954,6 +2571,7 @@ def run_bridge(args, config: dict) -> int:
     elif not port:
         log("serial: board not found; continuing with BLE/TCP")
     actions = Actions(config, dry_run=args.dry_run)
+    actions.warm_asr()
     try:
         bridge = Bridge(actions, port, args.tcp_port, args.listen, args.verbose,
                         enable_ble=args.ble, ble_name=args.ble_name)
@@ -1961,8 +2579,17 @@ def run_bridge(args, config: dict) -> int:
         log(f"bridge: {error}")
         release_single_instance()
         return 2
+    actions.say = bridge.say
+    actions.show_text = bridge.show_text
+    agent = Agent(config, actions, speak=bridge.say,
+                  show_text=bridge.show_text)
+    actions.agent = agent
+    log(f"assistant: {'enabled' if agent.enabled else 'disabled'} "
+        f"({agent.api} {config.get('llm_url')}, "
+        f"agents: {', '.join(agent._agent_commands()) or 'none'})")
     bridge.start_heartbeat()
-    log("bridge: ready for voice/enter/ime/wechat/orca/terminal/trae/chrome/edge")
+    log(f"bridge: ready {VERSION} for voice/enter/ime/wechat/orca/"
+        "terminal/trae/chrome/edge")
     try:
         while True:
             time.sleep(1.0)

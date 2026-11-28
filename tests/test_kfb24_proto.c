@@ -23,6 +23,14 @@ static void test_parse_cmd(void) {
     assert(!kfb24_proto_parse("KFB24 CMD voice -1", &msg));
     assert(!kfb24_proto_parse("KFB24 CMD 0123456789abcdef 1", &msg));
     assert(!kfb24_proto_parse(NULL, &msg));
+
+    assert(kfb24_proto_parse("KFB24 CTRL voice_stop 7", &msg));
+    assert(msg.type == KFB24_MSG_CTRL);
+    assert(msg.id == 7);
+    assert(strcmp(msg.name, "voice_stop") == 0);
+    assert(!kfb24_proto_parse("KFB24 CTRL voice_stop", &msg));
+    assert(!kfb24_proto_parse("KFB24 CTRL voice_stop 7 extra", &msg));
+    assert(!kfb24_proto_parse("KFB24 CTRL voice_stop x", &msg));
 }
 
 static void test_parse_hello_ack_state(void) {
@@ -91,6 +99,27 @@ static void test_hex_helpers(void) {
     assert(strcmp(encoded, "616263") == 0);
 }
 
+static void test_base64(void) {
+    uint8_t out[16];
+    size_t length = 99;
+    assert(kfb24_proto_b64_decode("", 0, out, sizeof(out), &length));
+    assert(length == 0);
+    assert(kfb24_proto_b64_decode("TWFu", 4, out, sizeof(out), &length));
+    assert(length == 3 && out[0] == 'M' && out[1] == 'a' && out[2] == 'n');
+    assert(kfb24_proto_b64_decode("TWE=", 4, out, sizeof(out), &length));
+    assert(length == 2 && out[0] == 'M' && out[1] == 'a');
+    assert(kfb24_proto_b64_decode("TQ==", 4, out, sizeof(out), &length));
+    assert(length == 1 && out[0] == 'M');
+    // No room for the decoded bytes.
+    assert(!kfb24_proto_b64_decode("TWFu", 4, out, 2, &length));
+    // Malformed inputs: bad alphabet, bad length, data after padding, truncation.
+    assert(!kfb24_proto_b64_decode("TW*=", 4, out, sizeof(out), &length));
+    assert(!kfb24_proto_b64_decode("TWF", 3, out, sizeof(out), &length));
+    assert(!kfb24_proto_b64_decode("TQ==TQ==", 8, out, sizeof(out), &length));
+    assert(!kfb24_proto_b64_decode("TQ", 2, out, sizeof(out), &length));
+    assert(!kfb24_proto_b64_decode("====TQ==", 8, out, sizeof(out), &length));
+}
+
 static void test_formatters(void) {
     char line[KFB24_PROTO_MAX_LINE];
     size_t length = kfb24_proto_fmt_cmd(line, sizeof(line), "wechat", 9);
@@ -105,6 +134,11 @@ static void test_formatters(void) {
     assert(length == strlen("KFB24 ACK 12 ERR\n"));
     assert(strcmp(line, "KFB24 ACK 12 ERR\n") == 0);
 
+    length = kfb24_proto_fmt_ctrl(line, sizeof(line), "voice_stop", 3);
+    assert(length == strlen("KFB24 CTRL voice_stop 3\n"));
+    assert(strcmp(line, "KFB24 CTRL voice_stop 3\n") == 0);
+    assert(kfb24_proto_fmt_ctrl(line, sizeof(line), "bad name", 1) == 0);
+
     length = kfb24_proto_fmt_state(line, sizeof(line), "wifi", true, "192.168.1.8");
     assert(length == strlen("KFB24 STATE wifi 1 192.168.1.8\n"));
     assert(kfb24_proto_fmt_state(line, sizeof(line), "wifi", false, NULL) ==
@@ -118,6 +152,7 @@ int main(void) {
     test_parse_hello_ack_state();
     test_parse_cfg();
     test_hex_helpers();
+    test_base64();
     test_formatters();
     puts("kfb24 protocol tests: PASS");
     return 0;

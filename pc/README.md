@@ -112,7 +112,8 @@ that connects to `kfb24` can send the same commands as the bridge, so enable
 
 | Board action | PC effect |
 | --- | --- |
-| `voice` | Streams the board microphone over the active link (USB, BLE, or Wi-Fi) into VB-CABLE's `CABLE Input`, so WeType records `CABLE Output`; holds the configured WeType hotkey (default `Ctrl+Win`). The next press stops both. Use WeType voice input, not Windows `Win+H`. |
+| `voice` | Streams the board microphone over the active link (USB, BLE, or Wi-Fi). With an offline model the bridge transcribes it itself; otherwise it feeds VB-CABLE's `CABLE Input` so WeType records `CABLE Output` and holds the configured hotkey (default `Ctrl+Win`). The next press stops both. Use WeType voice input, not Windows `Win+H`. |
+| `wake` | Hands-free session started by the board's wake word ("hello Xiaozhi"): with an offline model the bridge transcribes the utterance, executes an app command, or types it; otherwise it uses the WeType path, detects the pause, sends `KFB24 CTRL voice_stop`, and submits with Enter. See [Hands-free voice](#hands-free-voice-wake-word). |
 | `enter` | Presses Enter once in the focused window, so the recognised text is submitted (chat send, terminal run, search submit). During a voice session the bridge releases the hotkey and stops the stream first, then presses Enter. |
 | `ime` | Activates the WeType TSF profile (`{86598FB9-…}` / `{607FDF85-…}`, langid `0x0804`), falling back to the configured hotkey. |
 | `wechat` | Opens, restores, minimizes, or focuses a WeChat window, in that state order. |
@@ -149,11 +150,12 @@ they cannot redirect a session that is already running.
 
 Recognised text is never copied to the clipboard, and the bridge cannot address
 it to a specific application: WeType alone decides where the characters go.
-Nothing presses Enter automatically: WeType commits a moment after the hotkey
-is released, so an automatic keystroke would race the text, and the same Enter
-would submit a half-finished line. Send the `enter` action when the text looks
-right; the board's up/down keys only move the row selection and stop at the
-first and last row instead of wrapping.
+Manual sessions never press Enter automatically: WeType commits a moment after
+the hotkey is released, so an automatic keystroke would race the text, and the
+same Enter would submit a half-finished line. Send the `enter` action when the
+text looks right; the board's up/down keys only move the row selection and stop
+at the first and last row instead of wrapping. Hands-free sessions are the
+exception and submit themselves once speech has been heard; see below.
 
 Install VB-CABLE once from https://vb-audio.com/Cable/ (administrator, then
 reboot). In WeType's voice settings select
@@ -180,6 +182,127 @@ minimized, and any other window is focused. If a matching window exists but
 cannot be focused, the bridge reports failure instead of starting a duplicate
 process.
 
+## Hands-free voice (wake word)
+
+With the `model` partition flashed, the board runs WakeNet9s locally and streams
+nothing until it hears the wake phrase. On detection it sends `KFB24 CMD wake <id>`
+only while the bridge link is ready; the bridge records the utterance itself
+when an offline model is installed, otherwise it falls back to the WeType
+pipeline. Unlike a manual session, the bridge measures the RMS of every decoded
+40 ms block: once speech has lasted `wake_min_speech_ms`, a `wake_silence_ms`
+pause ends the utterance. The bridge sends `KFB24 CTRL voice_stop <id>` so the
+board stops capturing and frees the microphone, then either transcribes the
+recording or releases the WeType hotkey. A session with no speech within
+`wake_no_speech_ms` closes without acting; `wake_max_seconds` caps the whole
+session. The board ignores a new wake word for 1.2 s after a session ends.
+
+The ESP32-C3 has no acoustic echo cancellation: never play audio through the
+board while it listens, or its own output becomes the transcript. Wake
+detection needs the model partition and roughly 130 KB of free heap; when either
+is missing the board logs `wake: unavailable` and the button flow still works.
+`wake_vad_threshold` is the int16 RMS that counts as speech — raise it in a
+noisy room, lower it if a quiet speaker never triggers the end of speech.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `wake_silence_ms` | 900 | pause after speech that ends the utterance |
+| `wake_min_speech_ms` | 250 | speech required before a pause counts |
+| `wake_no_speech_ms` | 6000 | give up when nothing was said |
+| `wake_vad_threshold` | 300 | RMS that counts as speech |
+| `wake_max_seconds` | 25 | hard session cap; `0` disables it |
+| `wake_auto_enter` | true | press Enter after a completed utterance |
+| `wake_enter_delay_ms` | 700 | WeType-only delay between hotkey release and Enter |
+
+## Offline speech recognition and app commands
+
+`sherpa-onnx` with a SenseVoice model makes the bridge independent of WeType and
+VB-CABLE for hands-free use, and lets it act on what was said instead of only
+typing it. Install once (Windows, Python 3.9+):
+
+```powershell
+python -m pip install sherpa-onnx
+mkdir "%LOCALAPPDATA%\kfb24\models" -Force
+curl -L -o "%LOCALAPPDATA%\kfb24\models\sensevoice.tar.bz2" `
+  https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2
+tar -xjf "%LOCALAPPDATA%\kfb24\models\sensevoice.tar.bz2" -C "%LOCALAPPDATA%\kfb24\models"
+```
+
+The bridge finds the extracted `sherpa-onnx-sense-voice-*` directory
+automatically; `asr_model_dir` overrides it. It loads `model.int8.onnx` in the
+background at startup (about 240 MB). After the pause, recognition takes a few
+hundred milliseconds and the bridge either routes a command or types the text
+into the focused window with `SendInput` (no clipboard, no WeType). The command
+grammar is deliberately exact, so dictation that merely contains a keyword is
+never executed:
+
+- `<open verb> <app>` or just `<app>`: open or focus the configured app. App
+  aliases cover WeChat, Trae, Chrome (browser), Edge, terminal, and Orca;
+  open verbs include the Chinese equivalents of open, start, switch to, and go
+  back to.
+- Submit phrases (Enter, send, confirm) press Enter once.
+- `voice_commands` maps extra whole utterances to any action name:
+  `enter`, `ime`, `voice`, `wake`, `wechat`, `orca`, `terminal`, `trae`,
+  `chrome`, `edge`.
+- Anything else is dictated. Set `voice_dictation` to `false` to keep the
+  bridge command-only.
+
+When the model is absent — or `voice_backend` is `wetype` — the bridge keeps the
+old behavior: VB-CABLE plus the WeType hotkey, with the optional automatic
+Enter. `voice_backend` accepts `auto` (default: offline when the model exists),
+`sherpa`, or `wetype`.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `voice_backend` | `auto` | `auto`, `sherpa`, or `wetype` |
+| `asr_model_dir` | empty | explicit SenseVoice model directory |
+| `asr_threads` | 2 | ONNX inference threads |
+| `voice_commands` | `{}` | whole-utterance phrase to action map |
+| `voice_dictation` | true | type utterances that are not commands |
+
+## Talking to the assistant
+
+When an offline recogniser is active, a wake-word utterance that does not match
+the app command grammar goes to a local model instead of the focused window.
+The board shows a thinking panel, the bridge posts the transcript to Ollama (or
+any OpenAI-compatible server), and the answer is spoken through the board
+speaker while the same text appears in the dialog panel. The manual `voice`
+action still dictates; only the wake word holds a conversation.
+
+The default backend is Ollama at `http://127.0.0.1:11434`. With an empty
+`llm_model` the bridge picks the first installed model and logs its name.
+Thinking is disabled because a board conversation is latency-sensitive; a
+warm 2B model answers in about a second. Replies are capped at roughly two
+sentences, markdown and emoji are stripped, and `tts_voice` selects a Windows
+SAPI voice (empty: system default). Speech is rendered at 16 kHz mono and
+streamed to the board as IMA ADPCM blocks, the same format as the uplink; the
+firmware shows `KFB24 TEXT <base64>` and plays `KFB24 AUDIO P` blocks.
+
+The model may call `open_app`, `type_text`, `press_enter`, and
+`dispatch_agent`. `dispatch_agent` runs a CLI coding agent (`pi` by default,
+`claude` when configured) in `agent_workdir`, waits up to `agent_timeout`, and
+summarises the result. Commands are argv lists, so `{prompt}` is substituted
+without a shell. The exact app grammar runs first, so a plain "open ..." never
+waits for the model. If the server is unreachable the bridge logs
+`assistant: local model unavailable`, falls back to dictation, and retries
+after 30 s.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `assistant_enabled` | true | route unmatched wake utterances to the model |
+| `llm_api` | `ollama` | `ollama` (native API, thinking off) or `openai` |
+| `llm_url` | `http://127.0.0.1:11434` | server base URL |
+| `llm_model` | empty | model name; empty picks the first installed |
+| `llm_timeout` | 90 | chat request timeout in seconds |
+| `agent_commands` | `pi`, `claude` | name to argv template map |
+| `agent_workdir` | empty | CLI agent working directory; empty uses the bridge CWD |
+| `agent_timeout` | 600 | CLI agent timeout in seconds |
+| `tts_voice` | empty | SAPI voice name; empty uses the system default |
+| `tts_rate` | 0 | SAPI rate, -10 to 10 |
+
+`pi` is the default because Claude Code on this machine points at a proxy that
+rejects every model name; install a working CLI and change `agent_commands` to
+switch, no code change needed.
+
 ## Overrides
 
 The bridge reads `%APPDATA%\kfb24\bridge.json` when present. Every key is optional:
@@ -195,6 +318,28 @@ The bridge reads `%APPDATA%\kfb24\bridge.json` when present. Every key is option
   "voice_hotkey": "ctrl+win",
   "voice_mode": "latch",
   "voice_max_seconds": 60,
+  "wake_silence_ms": 900,
+  "wake_min_speech_ms": 250,
+  "wake_no_speech_ms": 6000,
+  "wake_vad_threshold": 300,
+  "wake_auto_enter": true,
+  "wake_enter_delay_ms": 700,
+  "wake_max_seconds": 25,
+  "voice_backend": "auto",
+  "asr_model_dir": "",
+  "asr_threads": 2,
+  "voice_commands": {"start coding": "trae"},
+  "voice_dictation": true,
+  "assistant_enabled": true,
+  "llm_api": "ollama",
+  "llm_url": "http://127.0.0.1:11434",
+  "llm_model": "",
+  "llm_timeout": 90,
+  "agent_commands": {"pi": ["pi", "-p", "--no-session", "{prompt}"]},
+  "agent_workdir": "",
+  "agent_timeout": 600,
+  "tts_voice": "",
+  "tts_rate": 0,
   "virtual_mic": "CABLE Input",
   "ime_hotkey": "ctrl+space"
 }
@@ -214,8 +359,8 @@ WeType's hold-to-talk mode in its voice-input settings.
 
 Use `--config PATH` for a different file, `--dry-run` to log actions without
 sending input or launching apps, and
-`--test-action voice|ime|wechat|orca|terminal|trae|chrome|edge` to test one action
-locally. `--verbose` prints board console logs and every protocol frame.
+`--test-action voice|wake|ime|wechat|orca|terminal|trae|chrome|edge` to test one
+action locally. `--verbose` prints board console logs and every protocol frame.
 
 ## Troubleshooting
 

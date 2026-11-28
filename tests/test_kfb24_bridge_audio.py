@@ -9,6 +9,7 @@ down USB/BLE/TCP and left the board showing "bridge offline" forever.
 """
 
 import os
+import struct
 import sys
 import threading
 import types
@@ -132,6 +133,61 @@ class VirtualMicLifecycleTest(unittest.TestCase):
 
         self.fake_sd.streams[-1].release_write.set()
         mic.stop()
+
+
+def pcm_block(amplitude: int) -> bytes:
+    return struct.pack("<640h", *([amplitude] * 640))
+
+
+class SpeechEndDetectorTests(unittest.TestCase):
+    def detector(self, **overrides) -> "bridge.SpeechEndDetector":
+        config = dict(bridge.DEFAULT_CONFIG_VALUES)
+        config.update(overrides)
+        return bridge.SpeechEndDetector(config)
+
+    def test_pause_after_speech_ends_the_utterance(self) -> None:
+        detector = self.detector(wake_min_speech_ms=80, wake_silence_ms=200)
+        loud = pcm_block(2000)
+        quiet = pcm_block(0)
+
+        # Quiet before the first loud block is not the end of a sentence.
+        for _ in range(3):
+            self.assertIsNone(detector.feed(quiet))
+        for _ in range(2):
+            self.assertIsNone(detector.feed(loud))
+        self.assertTrue(detector.heard_speech)
+
+        # 200 ms of quiet = five 40 ms blocks.
+        for _ in range(4):
+            self.assertIsNone(detector.feed(quiet))
+        self.assertEqual("silence", detector.feed(quiet))
+        self.assertIsNone(detector.feed(quiet))  # latched: only one verdict
+        self.assertTrue(detector.done)
+
+    def test_pure_silence_times_out_without_triggering_enter(self) -> None:
+        detector = self.detector(wake_no_speech_ms=600)
+        quiet = pcm_block(0)
+        reasons = [detector.feed(quiet) for _ in range(15)]
+        self.assertEqual("no_speech", reasons[-1])
+        self.assertFalse(detector.heard_speech)
+
+    def test_quiet_noise_below_threshold_is_not_speech(self) -> None:
+        detector = self.detector(wake_vad_threshold=300,
+                                 wake_no_speech_ms=1000)
+        for _ in range(10):
+            self.assertIsNone(detector.feed(pcm_block(100)))
+        self.assertFalse(detector.heard_speech)
+
+    def test_reset_starts_a_fresh_session(self) -> None:
+        detector = self.detector(wake_min_speech_ms=40, wake_silence_ms=120)
+        self.assertIsNone(detector.feed(pcm_block(2000)))
+        self.assertIsNone(detector.feed(pcm_block(0)))
+        self.assertIsNone(detector.feed(pcm_block(0)))
+        self.assertEqual("silence", detector.feed(pcm_block(0)))
+        detector.reset()
+        self.assertFalse(detector.done)
+        self.assertEqual(0.0, detector.elapsed_ms)
+        self.assertIsNone(detector.feed(pcm_block(2000)))
 
 
 if __name__ == "__main__":

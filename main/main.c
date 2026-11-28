@@ -9,6 +9,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "kfb24_audio.h"
 #include "kfb24_config.h"
 #include "kfb24_link.h"
 #include "kfb24_power.h"
@@ -41,7 +42,7 @@ static void input_task(void *arg) {
 }
 
 void app_main(void) {
-    ESP_LOGI(TAG, "kfb24 1.0.3 by 24 启动");
+    ESP_LOGI(TAG, "kfb24 1.0.5 by 24 启动");
 
     esp_err_t err = bsp_i2c_init();
     if (err != ESP_OK) ESP_LOGW(TAG, "I2C 初始化失败: %s", esp_err_to_name(err));
@@ -72,6 +73,8 @@ void app_main(void) {
     }
 
     kfb24_link_start(&cfg);
+    kfb24_link_set_voice_stop_handler(kfb24_audio_stop);
+    kfb24_audio_init();
     kfb24_power_start();
     kfb24_ui_start();
 

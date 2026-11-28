@@ -1,8 +1,10 @@
 #include "kfb24_link.h"
 
+#include "kfb24_audio.h"
 #include "kfb24_ble.h"
 #include "kfb24_config.h"
 #include "kfb24_proto.h"
+#include "kfb24_ui.h"
 
 #include "driver/usb_serial_jtag.h"
 #include "driver/usb_serial_jtag_vfs.h"
@@ -30,7 +32,7 @@
 #define USB_LINE_MAX KFB24_PROTO_MAX_LINE
 
 static const char *TAG = "kfb24_link";
-static const char *FW_VERSION = "kfb24/1.0.3";
+static const char *FW_VERSION = "kfb24/1.0.5";
 
 typedef struct {
     char name[16];
@@ -84,6 +86,7 @@ static char s_usb_line[USB_LINE_MAX];
 static size_t s_usb_line_len;
 static char s_tcp_line[USB_LINE_MAX];
 static size_t s_tcp_line_len;
+static void (*s_voice_stop_handler)(void);
 
 static uint32_t now_ms(void) {
     return (uint32_t)(esp_timer_get_time() / 1000);
@@ -425,6 +428,23 @@ static void handle_cfg(const kfb24_msg_t *msg) {
 }
 
 static void handle_line(const char *line, bool via_usb, bool via_ble) {
+    size_t raw_len = strlen(line);
+    if (strncmp(line, "KFB24 AUDIO P ", 14) == 0) {
+        kfb24_audio_play_line(line, raw_len);
+        return;
+    }
+    if (strncmp(line, "KFB24 TEXT ", 11) == 0) {
+        char text[KFB24_PROTO_MAX_LINE];
+        size_t text_len = 0;
+        if (!kfb24_proto_b64_decode(line + 11, raw_len - 11, (uint8_t *)text,
+                                    sizeof(text) - 1, &text_len)) {
+            return;
+        }
+        text[text_len] = '\0';
+        kfb24_ui_set_text(text);
+        return;
+    }
+
     kfb24_msg_t msg;
     if (!kfb24_proto_parse(line, &msg)) return;
 
@@ -445,6 +465,14 @@ static void handle_line(const char *line, bool via_usb, bool via_ble) {
     }
     case KFB24_MSG_ACK:
         status_ack(msg.id, msg.ok);
+        break;
+    case KFB24_MSG_CTRL:
+        if (strcmp(msg.name, "voice_stop") == 0 && s_voice_stop_handler) {
+            s_voice_stop_handler();
+            send_ack(msg.id, true);
+        } else {
+            send_ack(msg.id, false);
+        }
         break;
     case KFB24_MSG_CFG:
         if (!via_usb) {
@@ -670,6 +698,10 @@ static void link_task(void *arg) {
         send_state(false);
         vTaskDelay(pdMS_TO_TICKS(20));
     }
+}
+
+void kfb24_link_set_voice_stop_handler(void (*handler)(void)) {
+    s_voice_stop_handler = handler;
 }
 
 bool kfb24_link_send_cmd(const char *name, uint32_t id) {

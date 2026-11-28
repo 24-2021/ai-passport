@@ -76,6 +76,18 @@ bool kfb24_proto_parse(const char *line, kfb24_msg_t *out) {
         return true;
     }
 
+    if (strcmp(kind, "CTRL") == 0) {
+        char *name = next_token(&save);
+        char *id = next_token(&save);
+        if (!name || !id || next_token(&save)) return false;
+        uint32_t value = 0;
+        if (!parse_u32(id, UINT32_MAX, &value)) return false;
+        if (!copy_token(out->name, sizeof(out->name), name)) return false;
+        out->type = KFB24_MSG_CTRL;
+        out->id = value;
+        return true;
+    }
+
     if (strcmp(kind, "HELLO") == 0) {
         char *version = next_token(&save);
         if (next_token(&save)) return false;
@@ -166,6 +178,16 @@ size_t kfb24_proto_fmt_cmd(char *buf, size_t cap, const char *name, uint32_t id)
                                 name, (unsigned long)id));
 }
 
+size_t kfb24_proto_fmt_ctrl(char *buf, size_t cap, const char *name, uint32_t id) {
+    if (!buf || cap == 0 || !name || !*name || strlen(name) >= 16) return 0;
+    for (const char *p = name; *p; p++) {
+        if (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') return 0;
+    }
+    return finish_line(cap,
+                       snprintf(buf, cap, "%sCTRL %s %lu\n", KFB24_PROTO_PREFIX,
+                                name, (unsigned long)id));
+}
+
 size_t kfb24_proto_fmt_hello(char *buf, size_t cap, const char *version) {
     if (!buf || cap == 0) return 0;
     return finish_line(cap,
@@ -230,4 +252,44 @@ size_t kfb24_proto_hex_encode(const char *src, size_t src_len, char *out, size_t
     }
     out[src_len * 2] = '\0';
     return src_len * 2;
+}
+
+static int b64_value(char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+bool kfb24_proto_b64_decode(const char *src, size_t len, uint8_t *out,
+                            size_t cap, size_t *out_len) {
+    if (!src || !out || cap == 0) return false;
+    uint32_t acc = 0;
+    int bits = 0;
+    size_t n = 0;
+    int pad = 0;
+    for (size_t i = 0; i < len; i++) {
+        char c = src[i];
+        if (c == '=') {
+            pad++;
+            continue;
+        }
+        if (pad) return false;  // data after padding
+        int v = b64_value(c);
+        if (v < 0) return false;
+        acc = (acc << 6) | (uint32_t)v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            if (n >= cap) return false;
+            out[n++] = (uint8_t)((acc >> bits) & 0xFF);
+        }
+    }
+    if (len % 4 != 0) return false;
+    if (pad > 2) return false;
+    if (pad > 0 && bits != pad * 2) return false;
+    if (out_len) *out_len = n;
+    return true;
 }
